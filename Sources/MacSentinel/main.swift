@@ -378,6 +378,7 @@ struct MacSentinelApp: App {
     }
 }
 
+@MainActor
 struct ContentView: View {
     @EnvironmentObject private var model: AuditModel
 
