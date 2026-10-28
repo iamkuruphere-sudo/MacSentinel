@@ -1,10 +1,39 @@
 <p align="center">
-  <img src="Resources/logo-banner.svg" alt="MacSentinel Logo" width="760">
+  <a href="https://www.fullstopsolution.in">
+    <img src="https://raw.githubusercontent.com/iamkuruphere-sudo/fullstopsolution-website/main/assets/images/logo-wide.png" alt="Fullstop Solution Logo" width="360">
+  </a>
+</p>
+
+<p align="center">
+  <img src="Resources/logo-banner.svg" alt="MacSentinel Banner" width="720">
+</p>
+
+<p align="center">
+  <a href="https://www.fullstopsolution.in/macsentinel.html"><img src="https://img.shields.io/badge/Official%20Website-fullstopsolution.in-cyan?style=for-the-badge&logo=safari" alt="Official Website"></a>
+  <a href="https://www.fullstopsolution.in/downloads/mac/MacSentinel-arm64.dmg"><img src="https://img.shields.io/badge/Download%20DMG-v0.1.8%20(Apple%20Silicon)-brightgreen?style=for-the-badge&logo=apple" alt="Download DMG"></a>
+  <a href="https://github.com/iamkuruphere-sudo/MacSentinel/releases/latest"><img src="https://img.shields.io/badge/GitHub%20Release-v0.1.8-blue?style=for-the-badge&logo=github" alt="GitHub Release"></a>
+  <a href="https://www.fullstopsolution.in/security.html"><img src="https://img.shields.io/badge/Architecture-Zero--Telemetry-purple?style=for-the-badge" alt="Zero Telemetry"></a>
 </p>
 
 # MacSentinel
 
+Part of the **[Fullstop Solution](https://www.fullstopsolution.in)** precision software ecosystem.
+
 A native SwiftUI macOS app for collecting a point-in-time, read-only security evidence snapshot. It does not remove files, change settings, install agents, quarantine software, or claim a clean bill of health.
+
+---
+
+## ⬇️ Official Downloads & Web Portal
+
+| Resource | Link |
+|---|---|
+| 🌐 **Official Portal** | [www.fullstopsolution.in/macsentinel.html](https://www.fullstopsolution.in/macsentinel.html) |
+| 🍏 **Direct DMG Download** | [MacSentinel-arm64.dmg](https://www.fullstopsolution.in/downloads/mac/MacSentinel-arm64.dmg) (v0.1.8 • 1.82 MiB) |
+| 🛡️ **SHA-256 Checksum** | `a3aa26a0f0d32569ff83bdc7afaea77c7682e0c0989a0f7021d1554900ff0786` |
+| 📦 **GitHub Releases** | [MacSentinel Releases](https://github.com/iamkuruphere-sudo/MacSentinel/releases) |
+| 🪟 **Cross-Platform Suite** | [Fullstop Desktop Suite](https://www.fullstopsolution.in/#desktop) |
+
+---
 
 ## Checks included
 
@@ -14,7 +43,7 @@ A native SwiftUI macOS app for collecting a point-in-time, read-only security ev
 - Common launch-agent and launch-daemon folders plus Microsoft Office startup folders, where macro or add-in autoloading may occur.
 - Installer history and selected recent macOS Unified Log events related to persistence, privacy permissions, update activity, and code-signing.
 
-Items are evidence to inspect, not verdicts. Legitimate software commonly uses launch services, network connections, profiles, privacy permissions, and update helpers. The starter scanner gathers inventories and raw logs; it does not yet perform publisher reputation checks, malware signature matching, or compare the operating system against a known-good baseline.
+Items are evidence to inspect, not verdicts. Legitimate software commonly uses launch services, network connections, profiles, privacy permissions, and update helpers. The scanner gathers inventories and raw logs; it does not perform publisher reputation checks, malware signature matching, or compare the operating system against a known-good baseline.
 
 ## Logging
 
@@ -22,7 +51,18 @@ The app uses CocoaLumberjack to write its own audit lifecycle events to Unified 
 
 ## Build and run
 
-The locally built app bundle is `MacSentinel.app`. Open it from Finder to run the scan. The bundle is ad-hoc signed for local use, not Developer ID signed or notarized. To rebuild, open this folder in Xcode as a Swift package or run `swift run` from this directory. The first build resolves CocoaLumberjack from its official Swift Package Manager source. Requires macOS 14 or later.
+Requires macOS 14 or later. Building from source requires Swift 6.2 or later.
+
+Download `MacSentinel-arm64.dmg` from the [Fullstop Solution Portal](https://www.fullstopsolution.in/downloads/mac/MacSentinel-arm64.dmg) or the [latest GitHub release](https://github.com/iamkuruphere-sudo/MacSentinel/releases/latest), open the disk image, and drag `MacSentinel.app` to Applications.
+
+### macOS Gatekeeper Note
+Because this open-source build is distributed without a paid Apple Developer subscription, macOS Gatekeeper may protectively show a warning on first launch (*"Apple could not verify MacSentinel..."*). To open:
+```bash
+xattr -cr /Applications/MacSentinel.app
+```
+*(Alternatively, right-click `MacSentinel.app` in Finder, hold **Control**, and select **Open**).*
+
+To rebuild locally, open this folder in Xcode as a Swift package or run `swift run` from this directory. The first build resolves CocoaLumberjack from its official Swift Package Manager source.
 
 ## Boundaries and limitations
 
@@ -31,3 +71,17 @@ The locally built app bundle is `MacSentinel.app`. Open it from Finder to run th
 - The Office scan finds files in conventional startup locations. It does not inspect every document for macros and does not infer that an Office macro is malicious.
 - Run the app from a trusted source. This source project is not signed, notarized, or distributed as a hardened runtime application.
 - Review evidence with a trusted security professional before deleting or disabling anything.
+
+---
+
+### 🛡️ About Fullstop Solution
+
+**Fullstop Solution** ([www.fullstopsolution.in](https://www.fullstopsolution.in)) develops precision open-source software, native enterprise security auditing tools, and privacy-first digital engineering suites. Built for developers, security researchers, and system administrators who require absolute privacy, client-side execution, and zero cloud lock-in.
+
+- 🌐 **Official Website**: [https://www.fullstopsolution.in](https://www.fullstopsolution.in)
+- 🍏 **MacSentinel Portal**: [https://www.fullstopsolution.in/macsentinel.html](https://www.fullstopsolution.in/macsentinel.html)
+- ⬇️ **All Downloads & Desktop Tools**: [https://www.fullstopsolution.in/#desktop](https://www.fullstopsolution.in/#desktop)
+- 📂 **GitHub Organization**: [https://github.com/iamkuruphere-sudo](https://github.com/iamkuruphere-sudo)
+- 🔒 **Zero Telemetry Guarantee**: 100% client-side execution, zero external network leakage.
+
+© 2026 Fullstop Solution (www.fullstopsolution.in). All rights reserved.
