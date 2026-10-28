@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Resources/logo-banner.svg" alt="MacSentinel Logo" width="760">
+</p>
+
 # MacSentinel
 
 A native SwiftUI macOS app for collecting a point-in-time, read-only security evidence snapshot. It does not remove files, change settings, install agents, quarantine software, or claim a clean bill of health.
