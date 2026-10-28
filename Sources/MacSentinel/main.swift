@@ -5,7 +5,7 @@ import OSLog
 import CocoaLumberjackSwift
 import Security
 
-private let auditLog = Logger(subsystem: "local.macsentinel", category: "audit")
+@MainActor private let auditLog = Logger(subsystem: "local.macsentinel", category: "audit")
 
 private func configureLogging() {
     DDLog.add(DDOSLogger.sharedInstance)
@@ -314,6 +314,7 @@ struct Scanner {
 }
 
 @main
+@MainActor
 struct MacSentinelApp: App {
     @StateObject private var model = AuditModel()
     init() { configureLogging() }

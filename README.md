@@ -21,7 +21,7 @@ The app uses CocoaLumberjack to write its own audit lifecycle events to Unified 
 
 ## Build and run
 
-Requires macOS 14 or later. For Apple silicon, download `MacSentinel-arm64.dmg` from the [latest GitHub release](https://github.com/iamkuruphere-sudo/MacSentinel/releases/latest), open the disk image, and drag `MacSentinel.app` to Applications. New `v*` tags automatically build and attach the DMG to a GitHub release. A manual run of the **Build Apple silicon DMG** workflow also produces a downloadable Actions artifact.
+Requires macOS 14 or later. Building from source requires Swift 6.2 or later. For Apple silicon, download `MacSentinel-arm64.dmg` from the [latest GitHub release](https://github.com/iamkuruphere-sudo/MacSentinel/releases/latest), open the disk image, and drag `MacSentinel.app` to Applications. New `v*` tags automatically build and attach the DMG to a GitHub release. A manual run of the **Build Apple silicon DMG** workflow also produces a downloadable Actions artifact.
 
 The downloadable app is built for Apple silicon (`arm64`), ad-hoc signed for local use, and not Developer ID signed or notarized. macOS may require you to approve opening it because it is not notarized. To build locally, open this folder in Xcode as a Swift package or run `swift run`; the first build resolves CocoaLumberjack from its official Swift Package Manager source.
 
