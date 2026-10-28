@@ -938,7 +938,7 @@ struct ContentView: View {
         case let .upToDate(version):
             ("checkmark.circle", "MacSentinel is up to date", "Running version \(version); no newer GitHub release was found.", .secondary)
         case let .downloaded(version, url):
-            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", .green)
+            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. This community build is not notarized and may prompt Gatekeeper; proceed only if you trust the source. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", .green)
         case let .failed(message):
             ("exclamationmark.triangle", "Update check failed", "\(message) Your current app was not changed.", .orange)
         }
