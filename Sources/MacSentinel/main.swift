@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Darwin
+import Charts
 import OSLog
 import CocoaLumberjackSwift
 import Security
@@ -32,17 +33,69 @@ struct AuditReport: Codable {
     let limitations: [String]
 }
 
+struct EvidenceCategory: Identifiable {
+    let name: String
+    let count: Int
+    let reviewCount: Int
+    var id: String { name }
+}
+
 @MainActor
 final class AuditModel: ObservableObject {
     @Published var running = false
     @Published var evidence: [Evidence] = []
     @Published var lastRun: Date?
     @Published var error: String?
+    @Published var selectedCategory: String?
+
+    var reviewCount: Int {
+        evidence.filter { $0.level != .info }.count
+    }
+
+    var concernCount: Int {
+        evidence.filter { $0.level == .concern }.count
+    }
+
+    var categories: [EvidenceCategory] {
+        Dictionary(grouping: evidence, by: \.category)
+            .map { name, items in
+                EvidenceCategory(
+                    name: name,
+                    count: items.count,
+                    reviewCount: items.filter { $0.level != .info }.count
+                )
+            }
+            .sorted {
+                $0.count == $1.count
+                    ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    : $0.count > $1.count
+            }
+    }
+
+    var visibleEvidence: [Evidence] {
+        let filtered = selectedCategory.map { category in evidence.filter { $0.category == category } } ?? evidence
+        return filtered.sorted {
+            if $0.level != $1.level { return $0.level.sortOrder > $1.level.sortOrder }
+            if $0.category != $1.category { return $0.category < $1.category }
+            return $0.title < $1.title
+        }
+    }
+
+    var reviewEvidence: [Evidence] {
+        evidence
+            .filter { $0.level != .info }
+            .sorted {
+                if $0.level != $1.level { return $0.level == .concern }
+                if $0.category != $1.category { return $0.category < $1.category }
+                return $0.title < $1.title
+            }
+    }
 
     func run() {
         guard !running else { return }
         running = true
         error = nil
+        selectedCategory = nil
         DDLogInfo("Read-only endpoint audit started")
         auditLog.notice("Read-only endpoint audit started")
         Task.detached(priority: .userInitiated) {
@@ -327,52 +380,502 @@ struct MacSentinelApp: App {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AuditModel
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("MacSentinel").font(.largeTitle.bold())
-                    Text("Read-only endpoint evidence review").foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                header
+
+                if model.running {
+                    scanningState
+                } else if model.evidence.isEmpty {
+                    emptyState
+                } else {
+                    dashboard
                 }
-                Spacer()
-                Button { model.run() } label: {
-                    Label(model.running ? "Scanning…" : "Run scan", systemImage: "viewfinder")
-                }.buttonStyle(.borderedProminent).disabled(model.running)
-                Button { model.export() } label: { Label("Export report", systemImage: "square.and.arrow.up") }
-                    .disabled(model.evidence.isEmpty)
             }
-            if let lastRun = model.lastRun { Text("Last scan: \(lastRun.formatted(date: .abbreviated, time: .shortened))") .font(.caption).foregroundStyle(.secondary) }
-            HStack(spacing: 10) {
-                Label("Detection leads need review", systemImage: "checkmark.shield").font(.headline)
-                Spacer()
-                Text("Settings and files under review are not altered").font(.caption).foregroundStyle(.secondary)
-            }.padding(14).background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-            Text("Checks persistence, Office startup locations, update history, network listeners, profiles, extensions, core security settings, and recent Unified Logs. A scan cannot prove a device is clean or validate firmware from user space.")
-                .font(.callout).foregroundStyle(.secondary)
-            if let error = model.error { Text(error).foregroundStyle(.red) }
-            if model.evidence.isEmpty && !model.running {
-                ContentUnavailableView("No scan yet", systemImage: "desktopcomputer.trianglebadge.exclamationmark", description: Text("Run a scan to collect a point-in-time evidence snapshot."))
-                Spacer()
+            .frame(maxWidth: 1180, alignment: .leading)
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .alert("Could not export report", isPresented: Binding(
+            get: { model.error != nil },
+            set: { if !$0 { model.error = nil } }
+        )) {
+            Button("OK", role: .cancel) { model.error = nil }
+        } message: {
+            Text(model.error ?? "")
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 16) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 52, height: 52)
+                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("MacSentinel")
+                    .font(.title2.weight(.semibold))
+                Text("Read-only security evidence")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 16)
+
+            Button(action: model.run) {
+                Label(model.running ? "Scanning…" : "Run scan", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.running)
+            .keyboardShortcut("r", modifiers: [.command])
+
+            Button(action: model.export) {
+                Label("Export", systemImage: "square.and.arrow.up")
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.evidence.isEmpty || model.running)
+        }
+    }
+
+    private var emptyState: some View {
+        ContentUnavailableView {
+            Label("Your security snapshot starts here", systemImage: "shield.lefthalf.filled")
+        } description: {
+            Text("Run a local, read-only scan to collect system, network, persistence, and application-signature evidence.")
+        } actions: {
+            Button(action: model.run) {
+                Label("Run first scan", systemImage: "viewfinder")
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, minHeight: 420)
+        .background(.background, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(alignment: .bottom) {
+            Text("MacSentinel gathers evidence; it does not determine that a Mac is clean.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 20)
+        }
+    }
+
+    private var scanningState: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 14) {
+                ProgressView()
+                    .controlSize(.large)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Collecting security evidence")
+                        .font(.title3.weight(.semibold))
+                    Text("Checks run locally. Some system data may be unavailable without additional permissions.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background, in: RoundedRectangle(cornerRadius: 16))
+
+            if !model.evidence.isEmpty {
+                dashboard
+                    .opacity(0.55)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private var dashboard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            snapshotBanner
+            summaryMetrics
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 16)], alignment: .leading, spacing: 16) {
+                categoryPanel
+                reviewPanel
+            }
+
+            evidencePanel
+            limitationsNote
+        }
+    }
+
+    private var snapshotBanner: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: model.concernCount > 0 ? "exclamationmark.triangle.fill" : "doc.text.magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(model.concernCount > 0 ? Color.red : Color.accentColor)
+                .frame(width: 42, height: 42)
+                .background(
+                    (model.concernCount > 0 ? Color.red : Color.accentColor).opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(snapshotTitle)
+                    .font(.title3.weight(.semibold))
+                Text(snapshotDescription)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if let lastRun = model.lastRun {
+                    Label {
+                        Text("Scanned \(lastRun.formatted(date: .abbreviated, time: .shortened)) · \(Host.current().localizedName ?? "This Mac")")
+                    } icon: {
+                        Image(systemName: "clock")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background, in: RoundedRectangle(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        }
+    }
+
+    private var snapshotTitle: String {
+        if model.concernCount > 0 { return "\(model.concernCount) item\(model.concernCount == 1 ? "" : "s") marked for attention" }
+        if model.reviewCount > 0 { return "\(model.reviewCount) item\(model.reviewCount == 1 ? "" : "s") need review" }
+        return "Evidence collected"
+    }
+
+    private var snapshotDescription: String {
+        if model.reviewCount > 0 {
+            return "These results need context; a review flag is not a malware verdict."
+        }
+        return "No review flags in the evidence collected. This is not a clean bill of health."
+    }
+
+    private var summaryMetrics: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 12)], alignment: .leading, spacing: 12) {
+            MetricTile(
+                title: "Needs review",
+                value: "\(model.reviewCount)",
+                detail: "Evidence items",
+                symbol: "magnifyingglass",
+                tint: model.reviewCount > 0 ? .orange : .secondary
+            )
+            MetricTile(
+                title: "Collected",
+                value: "\(model.evidence.count)",
+                detail: "Evidence items",
+                symbol: "doc.text",
+                tint: .blue
+            )
+            MetricTile(
+                title: "Categories",
+                value: "\(model.categories.count)",
+                detail: "Areas inspected",
+                symbol: "square.grid.2x2",
+                tint: .teal
+            )
+        }
+    }
+
+    private var categoryPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            panelHeading("Evidence by category", subtitle: "Select a category to filter results.")
+
+            if model.categories.isEmpty {
+                Text("No category data was returned.")
+                    .foregroundStyle(.secondary)
             } else {
-                List {
-                    ForEach(model.evidence) { item in
-                        DisclosureGroup {
-                            Text(item.detail).font(.system(.caption, design: .monospaced)).textSelection(.enabled).padding(.vertical, 5)
-                        } label: {
-                            HStack {
-                                Image(systemName: item.level == .concern ? "exclamationmark.triangle.fill" : item.level == .review ? "magnifyingglass" : "checkmark.circle")
-                                    .foregroundStyle(item.level == .concern ? .red : item.level == .review ? .orange : .secondary)
-                                VStack(alignment: .leading) {
-                                    Text(item.title).fontWeight(.medium)
-                                    Text(item.category).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
+                Chart(model.categories) { category in
+                    BarMark(
+                        x: .value("Evidence items", category.count),
+                        y: .value("Category", category.name),
+                        height: 16
+                    )
+                    .foregroundStyle(category.reviewCount > 0 ? Color.orange.gradient : Color.accentColor.gradient)
+                    .cornerRadius(5)
+                }
+                .chartLegend(.hidden)
+                .chartXAxis {
+                    AxisMarks(position: .bottom, values: .automatic(desiredCount: 4)) { value in
+                        AxisGridLine()
+                        AxisValueLabel()
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(position: .leading) { _ in
+                        AxisValueLabel()
+                    }
+                }
+                .frame(height: max(150, CGFloat(model.categories.count) * 32))
+                .accessibilityLabel("Evidence items grouped by category")
+
+                Divider()
+
+                HStack {
+                    Picker("Filter evidence", selection: $model.selectedCategory) {
+                        Text("All categories").tag(String?.none)
+                        ForEach(model.categories) { category in
+                            Text(category.name).tag(Optional(category.name))
                         }
                     }
-                }.listStyle(.inset)
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .accessibilityLabel("Filter evidence by category")
+
+                    Spacer()
+
+                    Text("\(model.evidence.count) total")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            Text("Some checks may be partial without administrator access or Full Disk Access. Review unexpected names, paths, publishers, and dates before drawing conclusions.")
-                .font(.caption2).foregroundStyle(.secondary)
-        }.padding(22)
+        }
+        .panelStyle()
+    }
+
+    private var reviewPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            panelHeading(
+                "Review queue",
+                subtitle: model.reviewCount == 0 ? "No items are currently marked for review." : "Start with these incomplete or flagged checks."
+            )
+
+            if model.reviewEvidence.isEmpty {
+                Label("No review flags in this snapshot", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(Array(model.reviewEvidence.prefix(4))) { item in
+                    Button {
+                        model.selectedCategory = item.category
+                    } label: {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: item.level == .concern ? "exclamationmark.triangle.fill" : "magnifyingglass")
+                                .foregroundStyle(item.level == .concern ? Color.red : Color.orange)
+                                .frame(width: 18)
+                                .padding(.top, 2)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.title)
+                                    .font(.subheadline.weight(.medium))
+                                    .multilineTextAlignment(.leading)
+                                    .foregroundStyle(.primary)
+                                Text(item.category)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Filters the evidence list to \(item.category).")
+                }
+
+                if model.reviewCount > 4 {
+                    Text("+ \(model.reviewCount - 4) more items in the full evidence list")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                }
+            }
+        }
+        .panelStyle()
+    }
+
+    private var evidencePanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Collected evidence")
+                        .font(.headline)
+                    Text(model.selectedCategory ?? "Inspect individual results and command output.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if model.selectedCategory != nil {
+                    Button("Clear filter") { model.selectedCategory = nil }
+                        .buttonStyle(.borderless)
+                }
+
+                Text("\(model.visibleEvidence.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(model.visibleEvidence.enumerated()), id: \.element.id) { index, item in
+                    EvidenceRow(item: item)
+                    if index < model.visibleEvidence.count - 1 {
+                        Divider().padding(.leading, 32)
+                    }
+                }
+            }
+        }
+        .panelStyle()
+    }
+
+    private var limitationsNote: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Read this snapshot in context", systemImage: "info.circle")
+                .font(.subheadline.weight(.semibold))
+            Text("MacSentinel is a read-only triage tool, not antivirus software. Protected data may be unavailable, and a valid application signature does not establish that software is safe.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Unexpected names, paths, permissions, and connections are leads to investigate—not findings of malicious activity.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func panelHeading(_ title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.headline)
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct MetricTile: View {
+    let title: String
+    let value: String
+    let detail: String
+    let symbol: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 36, height: 36)
+                .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(value)
+                        .font(.title2.weight(.semibold).monospacedDigit())
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background, in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct EvidenceRow: View {
+    let item: Evidence
+
+    private var symbol: String {
+        switch item.level {
+        case .info: "checkmark.circle"
+        case .review: "magnifyingglass"
+        case .concern: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch item.level {
+        case .info: .secondary
+        case .review: .orange
+        case .concern: .red
+        }
+    }
+
+    var body: some View {
+        DisclosureGroup {
+            Text(item.detail)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+        } label: {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: symbol)
+                    .foregroundStyle(tint)
+                    .frame(width: 20)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(item.category)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Text(item.level.label)
+                    .font(.caption)
+                    .foregroundStyle(tint)
+            }
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .accessibilityHint("Shows the collected command output and details.")
+    }
+}
+
+private extension Evidence.Level {
+    var sortOrder: Int {
+        switch self {
+        case .info: 0
+        case .review: 1
+        case .concern: 2
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .info: "Collected"
+        case .review: "Review"
+        case .concern: "Attention"
+        }
+    }
+}
+
+private extension View {
+    func panelStyle() -> some View {
+        padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background, in: RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+            }
     }
 }
