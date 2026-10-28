@@ -36,12 +36,16 @@ jobs:
           BIN_PATH="$(swift build -c release --show-bin-path --arch arm64)"
           mkdir -p "$CONTENTS/MacOS"
           cp "$BIN_PATH/MacSentinel" "$CONTENTS/MacOS/MacSentinel"
+          mkdir -p "$CONTENTS/Resources"
+          cp Resources/MacSentinel.icns "$CONTENTS/Resources/MacSentinel.icns"
           cat > "$CONTENTS/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key>
+              <string>MacSentinel</string>
+              <key>CFBundleIconFile</key>
               <string>MacSentinel</string>
               <key>CFBundleIdentifier</key>
               <string>local.macsentinel</string>
