@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Darwin
 import Charts
+import CryptoKit
 import OSLog
 import CocoaLumberjackSwift
 import Security
@@ -311,6 +312,227 @@ final class AuditModel: ObservableObject {
     }
 }
 
+@MainActor
+final class UpdateModel: ObservableObject {
+    enum Status: Equatable {
+        case idle
+        case checking
+        case downloading(String)
+        case upToDate(String)
+        case downloaded(version: String, url: URL)
+        case failed(String)
+    }
+
+    @Published private(set) var status: Status = .idle
+    private var automaticCheckTask: Task<Void, Never>?
+    private var downloadedVersion: String?
+    private var downloadedURL: URL?
+
+    private static let currentVersionFallback = "0.1.11"
+    private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
+    private static let dmgName = "MacSentinel-arm64.dmg"
+
+    private var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? Self.currentVersionFallback
+    }
+
+    var isBusy: Bool {
+        switch status {
+        case .checking, .downloading: true
+        default: false
+        }
+    }
+
+    var buttonTitle: String {
+        switch status {
+        case .checking: "Checking…"
+        case .downloading: "Downloading…"
+        default: "Updates"
+        }
+    }
+
+    func startAutomaticChecks() {
+        guard automaticCheckTask == nil else { return }
+        automaticCheckTask = Task { [weak self] in
+            await self?.checkForUpdates()
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(86_400))
+                } catch {
+                    return
+                }
+                await self?.checkForUpdates()
+            }
+        }
+    }
+
+    func checkManually() {
+        Task { await checkForUpdates() }
+    }
+
+    func dismissStatus() {
+        guard !isBusy else { return }
+        status = .idle
+    }
+
+    func openDownloadedDMG(at url: URL) {
+        guard NSWorkspace.shared.open(url) else {
+            status = .failed("The downloaded DMG is at \(url.path), but macOS could not open it.")
+            return
+        }
+    }
+
+    private func checkForUpdates() async {
+        guard !isBusy else { return }
+        status = .checking
+
+        do {
+            var request = URLRequest(url: Self.latestReleaseURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            request.setValue("MacSentinel", forHTTPHeaderField: "User-Agent")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                throw UpdateError.releaseLookupFailed
+            }
+
+            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            let version = release.tagName.hasPrefix("v") ? String(release.tagName.dropFirst()) : release.tagName
+            guard Self.versionComponents(version) != nil else { throw UpdateError.invalidVersion }
+
+            guard Self.isNewer(version, than: currentVersion) else {
+                status = .upToDate(currentVersion)
+                return
+            }
+
+            if downloadedVersion == version,
+               let downloadedURL,
+               FileManager.default.fileExists(atPath: downloadedURL.path) {
+                status = .downloaded(version: version, url: downloadedURL)
+                return
+            }
+
+            guard let asset = release.assets.first(where: { $0.name == Self.dmgName }) else {
+                throw UpdateError.releaseAssetMissing
+            }
+            status = .downloading(version)
+            let url = try await download(asset, version: version)
+            downloadedVersion = version
+            downloadedURL = url
+            status = .downloaded(version: version, url: url)
+            auditLog.notice("Downloaded MacSentinel update \(version)")
+        } catch {
+            status = .failed(error.localizedDescription)
+            auditLog.error("Update check failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func download(_ asset: GitHubRelease.Asset, version: String) async throws -> URL {
+        guard let components = URLComponents(string: asset.downloadURL),
+              components.scheme == "https",
+              components.host == "github.com",
+              components.path.hasPrefix("/iamkuruphere-sudo/MacSentinel/releases/download/"),
+              let digest = asset.digest?.lowercased(),
+              digest.hasPrefix("sha256:") else {
+            throw UpdateError.invalidReleaseAsset
+        }
+        let expectedDigest = String(digest.dropFirst("sha256:".count))
+        guard expectedDigest.count == 64, expectedDigest.allSatisfy(\.isHexDigit) else {
+            throw UpdateError.invalidReleaseAsset
+        }
+        guard let downloadURL = components.url else { throw UpdateError.invalidReleaseAsset }
+
+        var request = URLRequest(url: downloadURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 180)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("MacSentinel", forHTTPHeaderField: "User-Agent")
+        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw UpdateError.downloadFailed
+        }
+
+        let digestData = try Data(contentsOf: temporaryURL, options: [.mappedIfSafe])
+        let actualDigest = SHA256.hash(data: digestData).map { String(format: "%02x", $0) }.joined()
+        guard actualDigest == expectedDigest else { throw UpdateError.checksumMismatch }
+
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
+
+        var destination = downloads.appendingPathComponent("MacSentinel-\(version)-arm64.dmg")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            let existingData = try Data(contentsOf: destination, options: [.mappedIfSafe])
+            let existingDigest = SHA256.hash(data: existingData).map { String(format: "%02x", $0) }.joined()
+            if existingDigest == expectedDigest {
+                try FileManager.default.removeItem(at: temporaryURL)
+                return destination
+            }
+            destination = downloads.appendingPathComponent("MacSentinel-\(version)-arm64-\(UUID().uuidString.prefix(8)).dmg")
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
+    }
+
+    private static func versionComponents(_ version: String) -> [Int]? {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard (2...3).contains(parts.count) else { return nil }
+        let values = parts.compactMap { Int($0) }
+        guard values.count == parts.count, parts.allSatisfy({ $0.allSatisfy(\.isNumber) }) else { return nil }
+        return values
+    }
+
+    private static func isNewer(_ candidate: String, than current: String) -> Bool {
+        guard let candidateParts = versionComponents(candidate),
+              let currentParts = versionComponents(current) else { return false }
+        for index in 0..<max(candidateParts.count, currentParts.count) {
+            let candidatePart = index < candidateParts.count ? candidateParts[index] : 0
+            let currentPart = index < currentParts.count ? currentParts[index] : 0
+            if candidatePart != currentPart { return candidatePart > currentPart }
+        }
+        return false
+    }
+
+    private struct GitHubRelease: Decodable {
+        let tagName: String
+        let assets: [Asset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case assets
+        }
+
+        struct Asset: Decodable {
+            let name: String
+            let downloadURL: String
+            let digest: String?
+
+            enum CodingKeys: String, CodingKey {
+                case name
+                case downloadURL = "browser_download_url"
+                case digest
+            }
+        }
+    }
+
+    private enum UpdateError: LocalizedError {
+        case releaseLookupFailed
+        case invalidVersion
+        case releaseAssetMissing
+        case invalidReleaseAsset
+        case downloadFailed
+        case checksumMismatch
+
+        var errorDescription: String? {
+            switch self {
+            case .releaseLookupFailed: "GitHub did not return a valid latest-release response."
+            case .invalidVersion: "The latest GitHub release has an unsupported version tag."
+            case .releaseAssetMissing: "The latest release does not contain the Apple-silicon DMG."
+            case .invalidReleaseAsset: "The release asset URL or SHA-256 digest is missing or invalid."
+            case .downloadFailed: "GitHub did not return the DMG successfully."
+            case .checksumMismatch: "The downloaded DMG did not match GitHub's published SHA-256 digest."
+            }
+        }
+    }
+}
+
 struct Scanner {
     static let limitations = [
         "This is a read-only triage scan, not an antivirus engine or proof that a Mac is clean.",
@@ -561,10 +783,14 @@ struct Scanner {
 @MainActor
 struct MacSentinelApp: App {
     @StateObject private var model = AuditModel()
+    @StateObject private var updater = UpdateModel()
     init() { configureLogging() }
     var body: some Scene {
         WindowGroup {
-            ContentView().environmentObject(model).frame(minWidth: 760, minHeight: 620)
+            ContentView()
+                .environmentObject(model)
+                .environmentObject(updater)
+                .frame(minWidth: 760, minHeight: 620)
         }.windowResizability(.contentSize)
     }
 }
@@ -572,11 +798,15 @@ struct MacSentinelApp: App {
 @MainActor
 struct ContentView: View {
     @EnvironmentObject private var model: AuditModel
+    @EnvironmentObject private var updater: UpdateModel
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+                if updater.status != .idle {
+                    updateBanner
+                }
 
                 if model.running {
                     scanningState
@@ -598,6 +828,9 @@ struct ContentView: View {
             Button("OK", role: .cancel) { model.error = nil }
         } message: {
             Text(model.error ?? "")
+        }
+        .task {
+            updater.startAutomaticChecks()
         }
     }
 
@@ -627,11 +860,87 @@ struct ContentView: View {
             .disabled(model.running)
             .keyboardShortcut("r", modifiers: [.command])
 
+            Button(action: updater.checkManually) {
+                Label(updater.buttonTitle, systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(updater.isBusy)
+            .help("Check GitHub Releases and download a newer MacSentinel DMG")
+
             Button(action: model.export) {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(.bordered)
             .disabled(model.evidence.isEmpty || model.running)
+        }
+    }
+
+    private var updateBanner: some View {
+        let copy = updateStatusCopy
+        return HStack(alignment: .top, spacing: 12) {
+            Image(systemName: copy.symbol)
+                .foregroundStyle(copy.tint)
+                .frame(width: 20)
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(copy.title)
+                    .font(.subheadline.weight(.semibold))
+                Text(copy.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Spacer(minLength: 8)
+
+            if case let .downloaded(_, url) = updater.status {
+                Button("Open DMG") {
+                    updater.openDownloadedDMG(at: url)
+                }
+                .buttonStyle(.bordered)
+            } else if case .failed = updater.status {
+                Button("Retry") {
+                    updater.checkManually()
+                }
+                .buttonStyle(.bordered)
+                .disabled(updater.isBusy)
+            }
+
+            if !updater.isBusy {
+                Button {
+                    updater.dismissStatus()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Dismiss update status")
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(copy.tint.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var updateStatusCopy: (symbol: String, title: String, detail: String, tint: Color) {
+        switch updater.status {
+        case .idle:
+            ("arrow.down.circle", "Updates", "No update check has run yet.", .secondary)
+        case .checking:
+            ("arrow.triangle.2.circlepath", "Checking for updates", "Checking the latest MacSentinel release on GitHub.", .secondary)
+        case let .downloading(version):
+            ("arrow.down.circle", "Downloading MacSentinel \(version)", "The DMG is being downloaded and its GitHub-published SHA-256 digest will be verified.", .accentColor)
+        case let .upToDate(version):
+            ("checkmark.circle", "MacSentinel is up to date", "Running version \(version); no newer GitHub release was found.", .secondary)
+        case let .downloaded(version, url):
+            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", .green)
+        case let .failed(message):
+            ("exclamationmark.triangle", "Update check failed", "\(message) Your current app was not changed.", .orange)
         }
     }
 

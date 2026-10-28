@@ -27,6 +27,10 @@ Requires macOS 14 or later. Building from source requires Swift 6.2 or later. Fo
 
 The downloadable app is built for Apple silicon (`arm64`) and includes the `Resources/MacSentinel.icns` app icon. If an Apple Developer ID certificate is configured in GitHub secrets, releases are notarized by Apple. Community releases without a Developer ID certificate use an ad-hoc signature to detect changes, but are not notarized and may trigger a Gatekeeper warning; this signature does not establish developer identity or make the app trusted by macOS. To try a community build, Control-click the app in Finder and select **Open**; if macOS still blocks it, use **System Settings → Privacy & Security → Open Anyway** only if you trust the download. Do not remove the app's quarantine attributes. To build locally, open this folder in Xcode as a Swift package or run `swift run`; the first build resolves CocoaLumberjack from its official Swift Package Manager source.
 
+## App updates
+
+MacSentinel checks the latest public GitHub Release on launch and every 24 hours while it is open. Use **Updates** in the app to check immediately. When a newer version-tagged release is available, the app downloads its Apple-silicon DMG to `~/Downloads` and verifies the SHA-256 digest reported by GitHub before making the file available to open. It does not replace the running app automatically: open the downloaded DMG, quit MacSentinel, then drag the app into Applications and confirm replacement. Updates are released from version tags; commits that have not been published as a GitHub Release are not offered by the updater.
+
 ## Boundaries and limitations
 
 - macOS privacy protections can hide databases and log details unless the app has Full Disk Access or administrator privileges. The report should be read as partial when a command is denied or returns incomplete data.
