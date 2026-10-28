@@ -16,10 +16,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Swift 6.1
+      - name: Set up Swift 6.2
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.1"
+          swift-version: "6.2"
 
       - name: Build Apple silicon executable
         run: swift build -c release --arch arm64
