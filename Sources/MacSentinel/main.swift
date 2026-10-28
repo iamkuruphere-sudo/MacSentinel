@@ -22,7 +22,191 @@ struct Evidence: Identifiable, Codable, Sendable {
     let title: String
     let detail: String
     let level: Level
+    let guidance: ScanGuidance?
     enum Level: String, Codable, Sendable { case info, review, concern }
+}
+
+struct ScanGuidance: Codable, Sendable {
+    let summary: String
+    let steps: [String]
+
+    static func assess(
+        title: String,
+        detail: String,
+        level: Evidence.Level
+    ) -> (level: Evidence.Level, guidance: ScanGuidance?) {
+        let output = detail.lowercased()
+        let hasIncompleteMarker = [
+            "unavailable:",
+            "[timed out;",
+            "[command exited with status",
+            "[command output capture limited",
+            "[output stream did not close"
+        ].contains { output.contains($0) }
+
+        switch title {
+        case "System Integrity Protection" where output.contains("status: disabled"):
+            return (
+                .concern,
+                ScanGuidance(
+                    summary: "System Integrity Protection is reported as disabled. This reduces macOS protection for system files and processes.",
+                    steps: [
+                        "If you did not intentionally disable it, restart into macOS Recovery. On Apple silicon, hold the power button until startup options appear and choose Options; on Intel, restart while holding Command-R.",
+                        "In Recovery, open Utilities > Terminal, run `csrutil enable`, then restart and run the scan again. Check with your administrator first on a managed Mac."
+                    ]
+                )
+            )
+        case "Gatekeeper assessment" where output.contains("assessments disabled"):
+            return (
+                .concern,
+                ScanGuidance(
+                    summary: "Gatekeeper assessments are reported as disabled, so macOS may not apply its normal checks to downloaded apps.",
+                    steps: [
+                        "Open System Settings > Privacy & Security and set downloaded-app protection to App Store and identified developers.",
+                        "Rerun the scan. Do not bypass a warning for an app you cannot verify with its publisher."
+                    ]
+                )
+            )
+        case "FileVault" where output.contains("filevault is off"):
+            return (
+                .concern,
+                ScanGuidance(
+                    summary: "FileVault is reported as off, so data on this Mac may not be protected by full-disk encryption.",
+                    steps: [
+                        "Open System Settings > Privacy & Security > FileVault and choose Turn On.",
+                        "Save the recovery method offered during setup somewhere separate from this Mac, then rerun the scan. Check with your administrator first on a managed Mac."
+                    ]
+                )
+            )
+        case "Firewall status" where output.contains("firewall is disabled") || output.contains("firewall is not enabled"):
+            return (
+                .concern,
+                ScanGuidance(
+                    summary: "The macOS application firewall is reported as disabled.",
+                    steps: [
+                        "Open System Settings > Network > Firewall and turn it on.",
+                        "Review Firewall Options for your sharing needs; avoid enabling “Block all incoming connections” unless you understand the impact."
+                    ]
+                )
+            )
+        case "Remote login service" where output.contains("remote login: on"):
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "Remote Login (SSH) is enabled. Keep it on only if you use remote administration.",
+                    steps: [
+                        "If you do not need SSH access, open System Settings > General > Sharing > Remote Login and turn it off.",
+                        "If you do need it, restrict “Allow access for” to the specific accounts that require access and confirm the setting with your administrator on a managed Mac."
+                    ]
+                )
+            )
+        case "Available macOS software updates"
+            where output.contains("software update found the following") || output.contains("* label:"):
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "macOS reports one or more updates. The scan does not determine whether an update addresses a vulnerability.",
+                    steps: [
+                        "Open System Settings > General > Software Update and review the offered updates.",
+                        "Back up important data, install updates appropriate for this Mac, restart if requested, then rerun the scan."
+                    ]
+                )
+            )
+        case "Application scan limit":
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "The application-signature inventory stopped at its 100-app limit; additional apps were not checked.",
+                    steps: [
+                        "Treat the application-signature results as partial, especially if you have many installed apps.",
+                        "Review apps outside the listed scan results in Finder and verify unfamiliar apps with their publishers before opening or removing them."
+                    ]
+                )
+            )
+        case "Application scan coverage":
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "One or more application folders could not be enumerated, so signature coverage is incomplete.",
+                    steps: [
+                        "Check the folder paths shown below and whether your account is expected to have access.",
+                        "If the folder is managed or protected, ask your administrator to confirm coverage rather than changing its permissions."
+                    ]
+                )
+            )
+        default:
+            break
+        }
+
+        if title.localizedCaseInsensitiveContains("code signature"),
+           output.contains("signature missing or invalid") || output.contains("could not inspect code signature") {
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "The app's signature could not be verified. This does not by itself prove the app is malicious.",
+                    steps: [
+                        "If you recognize the app, download a fresh copy from the developer's official source and verify it again.",
+                        "If you do not recognize it, do not open it. Confirm its publisher and ownership first; use the developer's uninstaller if you decide it should be removed."
+                    ]
+                )
+            )
+        }
+
+        if title == "Launch agents, daemons, and Office startup files",
+           detail.contains(" | modified ") || detail.contains("Name heuristic:") {
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "Startup locations contain entries to review; legitimate apps also use these locations.",
+                    steps: [
+                        "For an unfamiliar `.plist`, inspect its `Label`, `Program`, and `ProgramArguments` and confirm which installed app owns it. For Office startup files, verify the publisher and expected macro or add-in.",
+                        "If an entry belongs to software you do not want, use that software's official uninstaller or disable its login item in System Settings > General > Login Items. Do not delete files based only on their names."
+                    ]
+                )
+            )
+        }
+
+        if title == "Nonstandard boot arguments",
+           !output.isEmpty,
+           !output.contains("data was not found"),
+           !output.contains("error getting variable") {
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "Boot arguments are configured. They can be intentional, but unexpected values deserve verification.",
+                    steps: [
+                        "Compare the values below with changes you or your administrator intentionally made.",
+                        "If you cannot account for them, ask your administrator or Apple Support to review them before changing boot settings."
+                    ]
+                )
+            )
+        }
+
+        if hasIncompleteMarker {
+            return (
+                .review,
+                ScanGuidance(
+                    summary: "This check did not collect complete evidence; it is not a security verdict.",
+                    steps: [
+                        "Read the command output below to identify whether the check timed out, was denied, or failed.",
+                        "Rerun the scan after closing unusually busy apps. If access is denied, use your Mac administrator or device manager to confirm whether the check is expected to be restricted."
+                    ]
+                )
+            )
+        }
+
+        guard level != .info else { return (level, nil) }
+        return (
+            level,
+            ScanGuidance(
+                summary: "This item needs context; the available evidence does not establish that it is malicious.",
+                steps: [
+                    "Read the collected output below and compare it with software and settings you expect on this Mac.",
+                    "If you cannot identify the owner or purpose, confirm with the software publisher or your administrator before disabling or removing anything."
+                ]
+            )
+        )
+    }
 }
 
 struct AuditReport: Codable {
@@ -212,7 +396,14 @@ struct Scanner {
     private func add(_ out: inout [Evidence], _ category: String, _ title: String, _ detail: String, _ level: Evidence.Level = .info) {
         let shown = detail.isEmpty ? "No output returned." : String(detail.prefix(5000))
         let clipped = detail.count > 5000 ? "\n[Display limited to 5,000 characters.]" : ""
-        out.append(Evidence(category: category, title: title, detail: shown + clipped, level: level))
+        let assessment = ScanGuidance.assess(title: title, detail: shown + clipped, level: level)
+        out.append(Evidence(
+            category: category,
+            title: title,
+            detail: shown + clipped,
+            level: assessment.level,
+            guidance: assessment.guidance
+        ))
     }
 
     func scan() -> [Evidence] {
@@ -643,8 +834,10 @@ struct ContentView: View {
     private var reviewPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             panelHeading(
-                "Review queue",
-                subtitle: model.reviewCount == 0 ? "No items are currently marked for review." : "Start with these incomplete or flagged checks."
+                "Review & response",
+                subtitle: model.reviewCount == 0
+                    ? "No items are currently marked for review."
+                    : "Evidence-linked next steps. MacSentinel never changes settings for you."
             )
 
             if model.reviewEvidence.isEmpty {
@@ -666,9 +859,16 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.medium))
                                     .multilineTextAlignment(.leading)
                                     .foregroundStyle(.primary)
-                                Text(item.category)
+                                Text(item.guidance?.summary ?? item.category)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                if let firstStep = item.guidance?.steps.first {
+                                    Text(firstStep)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "chevron.right")
@@ -817,6 +1017,30 @@ private struct EvidenceRow: View {
 
     var body: some View {
         DisclosureGroup {
+            if let guidance = item.guidance {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Suggested next steps", systemImage: "lightbulb")
+                        .font(.subheadline.weight(.semibold))
+                    Text(guidance.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(guidance.steps.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("\(index + 1).")
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Text(step)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                .padding(.vertical, 8)
+            }
+
             Text(item.detail)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)

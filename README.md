@@ -11,7 +11,7 @@ A native SwiftUI macOS app for collecting a point-in-time, read-only security ev
 - Common launch-agent and launch-daemon folders plus Microsoft Office startup folders, where macro or add-in autoloading may occur.
 - Installer history and selected recent macOS Unified Log events related to persistence, privacy permissions, update activity, and code-signing.
 
-The dashboard turns each scan into an evidence-first overview with review counts, category breakdowns, a prioritized review queue, and expandable command results. It does not calculate a security score or label a device clean.
+The dashboard turns each scan into an evidence-first overview with review counts, category breakdowns, evidence-linked next steps, and expandable command results. Suggestions explain practical settings or verification steps for recognized results; they do not change the Mac automatically, and ambiguous evidence is explicitly presented as something to investigate rather than a malware verdict. It does not calculate a security score or label a device clean.
 
 Items are evidence to inspect, not verdicts. Legitimate software commonly uses launch services, network connections, profiles, privacy permissions, and update helpers. Application signatures are checked for cryptographic integrity; a valid signature does not establish that an app is benign or free of vulnerabilities. The scanner does not perform publisher reputation checks, malware signature matching, CVE-to-version matching, or compare the operating system against a known-good baseline.
 
