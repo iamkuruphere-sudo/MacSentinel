@@ -21,37 +21,44 @@ jobs:
         with:
           swift-version: "6.2"
 
-      - name: Import Developer ID certificate
+      - name: Configure code signing
+        id: signing
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "$APPLE_CERTIFICATE_BASE64" || { echo "Missing APPLE_CERTIFICATE_BASE64 repository secret." >&2; exit 1; }
-          test -n "$APPLE_CERTIFICATE_PASSWORD" || { echo "Missing APPLE_CERTIFICATE_PASSWORD repository secret." >&2; exit 1; }
+          if [ -n "${APPLE_CERTIFICATE_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "Configuring Apple Developer ID signing identity..."
+            KEYCHAIN_PATH="$RUNNER_TEMP/macsentinel-signing.keychain-db"
+            KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+            CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
 
-          KEYCHAIN_PATH="$RUNNER_TEMP/macsentinel-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
-          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+            security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH"
+            rm -f "$CERTIFICATE_PATH"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
-          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH"
-          rm -f "$CERTIFICATE_PATH"
+            SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F '"' '/Developer ID Application:/ { print $2; exit }')"
+            if [ -n "$SIGNING_IDENTITY" ]; then
+              echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+              echo "has_developer_id=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
 
-          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F '"' '/Developer ID Application:/ { print $2; exit }')"
-          test -n "$SIGNING_IDENTITY" || { echo "Imported certificate does not contain a valid Developer ID Application identity." >&2; exit 1; }
-          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "has_developer_id=false" >> "$GITHUB_OUTPUT"
+          echo "No Apple Developer ID certificate configured. Falling back to ad-hoc signing for open-source distribution."
 
       - name: Build Apple silicon executable
         run: swift build -c release --arch arm64
 
-      - name: Package application and DMG
+      - name: Package application bundle
         run: |
           set -euo pipefail
           APP="MacSentinel.app"
@@ -92,22 +99,23 @@ jobs:
           </plist>
           PLIST
           plutil -lint "$CONTENTS/Info.plist"
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+
+          if [ "${{ steps.signing.outputs.has_developer_id }}" = "true" ]; then
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+          else
+            codesign --force --deep --sign - --timestamp=none "$APP"
+          fi
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=2 "$APP"
 
       - name: Notarize and staple application
+        if: steps.signing.outputs.has_developer_id == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          APP="MacSentinel.app"
-          test -n "$APPLE_ID" || { echo "Missing APPLE_ID repository secret." >&2; exit 1; }
-          test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "Missing APPLE_APP_SPECIFIC_PASSWORD repository secret." >&2; exit 1; }
-          test -n "$APPLE_TEAM_ID" || { echo "Missing APPLE_TEAM_ID repository secret." >&2; exit 1; }
-
           ditto -c -k --keepParent MacSentinel.app "$RUNNER_TEMP/MacSentinel-notarization.zip"
           xcrun notarytool submit "$RUNNER_TEMP/MacSentinel-notarization.zip" \
             --apple-id "$APPLE_ID" \
@@ -118,21 +126,27 @@ jobs:
           xcrun stapler validate MacSentinel.app
           codesign --verify --deep --strict --verbose=2 MacSentinel.app
 
-      - name: Create and notarize disk image
+      - name: Create disk image
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mkdir -p dmg-root
+          cp -R "MacSentinel.app" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "MacSentinel" -srcfolder dmg-root -ov -format UDZO "dist/MacSentinel-arm64.dmg"
+          hdiutil verify "dist/MacSentinel-arm64.dmg"
+          if [ "${{ steps.signing.outputs.has_developer_id }}" != "true" ]; then
+            codesign --force --sign - "dist/MacSentinel-arm64.dmg"
+          fi
+
+      - name: Notarize and staple disk image
+        if: steps.signing.outputs.has_developer_id == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          APP="MacSentinel.app"
-          mkdir -p dist
-          mkdir -p dmg-root
-          cp -R "$APP" dmg-root/
-          ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "MacSentinel" -srcfolder dmg-root -ov -format UDZO "dist/MacSentinel-arm64.dmg"
-          hdiutil verify "dist/MacSentinel-arm64.dmg"
-
           xcrun notarytool submit "dist/MacSentinel-arm64.dmg" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
@@ -141,11 +155,17 @@ jobs:
           xcrun stapler staple "dist/MacSentinel-arm64.dmg"
           xcrun stapler validate "dist/MacSentinel-arm64.dmg"
 
+      - name: Verify disk image contents
+        run: |
+          set -euo pipefail
+          APP="MacSentinel.app"
           MOUNTPOINT="$(mktemp -d)"
           trap 'hdiutil detach "$MOUNTPOINT" -quiet || true; rmdir "$MOUNTPOINT"' EXIT
           hdiutil attach "dist/MacSentinel-arm64.dmg" -readonly -nobrowse -mountpoint "$MOUNTPOINT"
           codesign --verify --deep --strict --verbose=2 "$MOUNTPOINT/$APP"
-          spctl --assess --type execute --verbose=4 "$MOUNTPOINT/$APP"
+          if [ "${{ steps.signing.outputs.has_developer_id }}" = "true" ]; then
+            spctl --assess --type execute --verbose=4 "$MOUNTPOINT/$APP"
+          fi
           test -s "$MOUNTPOINT/$APP/Contents/Resources/MacSentinel.icns"
 
       - name: Upload DMG artifact
@@ -160,4 +180,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/MacSentinel-arm64.dmg --title "MacSentinel $GITHUB_REF_NAME" --generate-notes
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.signing.outputs.has_developer_id }}" = "true" ]; then
+            gh release create "$GITHUB_REF_NAME" dist/MacSentinel-arm64.dmg --title "MacSentinel $GITHUB_REF_NAME" --generate-notes
+          else
+            gh release create "$GITHUB_REF_NAME" dist/MacSentinel-arm64.dmg \
+              --title "MacSentinel $GITHUB_REF_NAME" \
+              --notes $'### MacSentinel '"$GITHUB_REF_NAME"$' (macOS Apple silicon)\n\n#### Installation & Gatekeeper Note\nBecause this open-source build is not signed with an Apple Developer Program certificate, macOS Gatekeeper may show:\n> *"Apple could not verify MacSentinel is free of malware"*\n\n**To open MacSentinel:**\n1. Drag **MacSentinel.app** to your `/Applications` folder.\n2. Open **Terminal** and run:\n   ```bash\n   xattr -cr /Applications/MacSentinel.app\n   ```\n*(Alternatively, right-click / Control-click **MacSentinel.app** in Finder, select **Open**, and confirm, or go to **System Settings \u2192 Privacy & Security** and click **Open Anyway**).*'
+          fi

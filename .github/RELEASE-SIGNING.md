@@ -1,10 +1,20 @@
 # macOS release signing
 
-The release workflow signs the app with a Developer ID Application certificate, notarizes both the app and disk image with Apple, staples Apple's tickets, and verifies Gatekeeper acceptance before publishing. Release builds intentionally fail rather than falling back to an ad-hoc signature.
+The release workflow supports both **Apple Developer ID signed & notarized releases** (for maintainers with a paid Apple Developer membership) and **ad-hoc signed community releases** (for open-source builds without an Apple Developer ID).
 
-## Required GitHub Actions secrets
+## Signing Modes
 
-Add these secrets under **Repository Settings → Secrets and variables → Actions**:
+1. **Community / Open-Source Mode (Default)**:
+   - When Apple signing secrets are not present, the workflow builds, packages, and signs the app bundle and DMG with an ad-hoc signature (`codesign --sign -`).
+   - The release notes provide clear instructions for macOS Gatekeeper so users can open the app (`xattr -cr /Applications/MacSentinel.app` or right-click -> Open).
+   - This ensures releases and CI runs succeed without requiring a paid Apple Developer account.
+
+2. **Apple Developer ID Mode (Optional)**:
+   - When all five Apple secrets are provided, the workflow signs the app with a Developer ID Application certificate, notarizes both the app and disk image with Apple via `xcrun notarytool`, staples Apple's tickets, and verifies Gatekeeper assessment before publishing.
+
+## Optional GitHub Actions secrets (for Apple Notarization)
+
+If you have an active Apple Developer Program account, add these secrets under **Repository Settings → Secrets and variables → Actions**:
 
 | Secret | Value |
 |---|---|
@@ -14,8 +24,6 @@ Add these secrets under **Repository Settings → Secrets and variables → Acti
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple Account. |
 | `APPLE_TEAM_ID` | Apple Developer Team ID that owns the certificate. |
 
-Export the Developer ID certificate together with its private key from Keychain Access. Encode the exported file locally (for example, `base64 < DeveloperID.p12 | pbcopy`) and paste the result directly into the `APPLE_CERTIFICATE_BASE64` secret. Do not commit the certificate, private key, password, or encoded certificate to the repository or paste them into an issue or chat.
+Export the Developer ID certificate together with its private key from Keychain Access. Encode the exported file locally (`base64 < DeveloperID.p12 | pbcopy`) and paste the result into `APPLE_CERTIFICATE_BASE64`. Do not commit the certificate, private key, or password to the repository.
 
-After adding all five secrets, run **Actions → Build Apple silicon DMG → Run workflow** to test a notarized artifact, or push a new `v*` tag to create a GitHub release. The workflow verifies the signature, notarization ticket, disk image, and Gatekeeper assessment before uploading anything.
-
-The previously published releases were signed ad hoc and are not notarized. They cannot be made trusted by changing their existing files or tags; publish a new version after configuring these secrets.
+Once configured, any new release will automatically be notarized and trusted by macOS Gatekeeper out-of-the-box.
