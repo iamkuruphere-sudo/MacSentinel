@@ -64,11 +64,20 @@ jobs:
           </dict>
           </plist>
           PLIST
+          plutil -lint "$CONTENTS/Info.plist"
+          codesign --force --deep --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
           mkdir -p dist
           mkdir -p dmg-root
           cp -R "$APP" dmg-root/
           ln -s /Applications dmg-root/Applications
           hdiutil create -volname "MacSentinel" -srcfolder dmg-root -ov -format UDZO "dist/MacSentinel-arm64.dmg"
+          hdiutil verify "dist/MacSentinel-arm64.dmg"
+          MOUNTPOINT="$(mktemp -d)"
+          trap 'hdiutil detach "$MOUNTPOINT" -quiet || true; rmdir "$MOUNTPOINT"' EXIT
+          hdiutil attach "dist/MacSentinel-arm64.dmg" -readonly -nobrowse -mountpoint "$MOUNTPOINT"
+          codesign --verify --deep --strict --verbose=2 "$MOUNTPOINT/$APP"
+          test -s "$MOUNTPOINT/$APP/Contents/Resources/MacSentinel.icns"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
