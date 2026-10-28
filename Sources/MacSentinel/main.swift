@@ -1,0 +1,253 @@
+import SwiftUI
+import AppKit
+import OSLog
+import CocoaLumberjackSwift
+
+private let auditLog = Logger(subsystem: "local.macsentinel", category: "audit")
+
+private func configureLogging() {
+    DDLog.add(DDOSLogger.sharedInstance)
+    let fileLogger = DDFileLogger()
+    fileLogger.rollingFrequency = 60 * 60 * 24
+    fileLogger.logFileManager.maximumNumberOfLogFiles = 7
+    DDLog.add(fileLogger)
+}
+
+struct Evidence: Identifiable, Codable, Sendable {
+    var id = UUID()
+    let category: String
+    let title: String
+    let detail: String
+    let level: Level
+    enum Level: String, Codable, Sendable { case info, review, concern }
+}
+
+struct AuditReport: Codable {
+    let generatedAt: Date
+    let host: String
+    let macOS: String
+    let evidence: [Evidence]
+    let limitations: [String]
+}
+
+@MainActor
+final class AuditModel: ObservableObject {
+    @Published var running = false
+    @Published var evidence: [Evidence] = []
+    @Published var lastRun: Date?
+    @Published var error: String?
+
+    func run() {
+        guard !running else { return }
+        running = true
+        error = nil
+        DDLogInfo("Read-only endpoint audit started")
+        auditLog.notice("Read-only endpoint audit started")
+        Task.detached(priority: .userInitiated) {
+            let findings = Scanner().scan()
+            await MainActor.run {
+                self.evidence = findings
+                self.lastRun = Date()
+                self.running = false
+                DDLogInfo("Audit finished with \(findings.count) evidence items")
+                auditLog.notice("Audit finished with \(findings.count) evidence items")
+            }
+        }
+    }
+
+    func export() {
+        let report = AuditReport(generatedAt: lastRun ?? Date(), host: Host.current().localizedName ?? "Mac",
+                                 macOS: ProcessInfo.processInfo.operatingSystemVersionString,
+                                 evidence: evidence, limitations: Scanner.limitations)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "MacSentinel-Evidence-\(ISO8601DateFormatter().string(from: report.generatedAt).prefix(10)).json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(report).write(to: url, options: .atomic)
+            DDLogInfo("Evidence report exported")
+            auditLog.notice("Evidence report exported")
+        } catch { self.error = "Could not save report: \(error.localizedDescription)" }
+    }
+}
+
+struct Scanner {
+    static let limitations = [
+        "This is a read-only triage scan, not an antivirus engine or proof that a Mac is clean.",
+        "Some system databases and protected logs require Full Disk Access or administrator approval; inaccessible data is reported as limited.",
+        "Firmware integrity and spyware cannot be conclusively established by a user-space scan. Use Apple Diagnostics and trusted Apple recovery/reinstall workflows for deeper validation.",
+        "A file name, unsigned component, remote connection, or privacy permission can be legitimate. Review context before acting."
+    ]
+
+    private final class BoundedCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes = Data()
+        private let limit = 65_536
+        private var truncated = false
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            lock.lock(); defer { lock.unlock() }
+            let remaining = limit - bytes.count
+            if remaining > 0 { bytes.append(chunk.prefix(remaining)) }
+            if chunk.count > remaining { truncated = true }
+        }
+
+        func result() -> (Data, Bool) {
+            lock.lock(); defer { lock.unlock() }
+            return (bytes, truncated)
+        }
+    }
+
+    private func command(_ path: String, _ args: [String] = [], timeout: TimeInterval = 18) -> String {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+        let out = Pipe(); let capture = BoundedCapture()
+        p.standardOutput = out; p.standardError = out
+        out.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { handle.readabilityHandler = nil } else { capture.append(chunk) }
+        }
+        do {
+            try p.run()
+            // Close the parent's write end so the reader receives EOF after the child exits.
+            try? out.fileHandleForWriting.close()
+            let deadline = Date().addingTimeInterval(timeout)
+            while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            let timedOut = p.isRunning
+            if timedOut { p.terminate(); p.waitUntilExit() }
+            out.fileHandleForReading.readabilityHandler = nil
+            capture.append(out.fileHandleForReading.readDataToEndOfFile())
+            try? out.fileHandleForReading.close()
+            let (data, truncated) = capture.result()
+            var text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if truncated { text += "\n[Command output capture limited to 64 KB.]" }
+            if timedOut { text += "\n[Timed out; output may be incomplete.]" }
+            return text
+        } catch { return "Unavailable: \(error.localizedDescription)" }
+    }
+
+    private func add(_ out: inout [Evidence], _ category: String, _ title: String, _ detail: String, _ level: Evidence.Level = .info) {
+        let shown = detail.isEmpty ? "No output returned." : String(detail.prefix(5000))
+        let clipped = detail.count > 5000 ? "\n[Display limited to 5,000 characters.]" : ""
+        out.append(Evidence(category: category, title: title, detail: shown + clipped, level: level))
+    }
+
+    func scan() -> [Evidence] {
+        var e: [Evidence] = []
+        add(&e, "System integrity", "System Integrity Protection", command("/usr/bin/csrutil", ["status"]))
+        add(&e, "System integrity", "Gatekeeper assessment", command("/usr/sbin/spctl", ["--status"]))
+        add(&e, "System integrity", "Sealed system volume", command("/usr/bin/csrutil", ["authenticated-root", "status"]))
+        add(&e, "System integrity", "Nonstandard boot arguments", command("/usr/sbin/nvram", ["boot-args"]))
+        add(&e, "System integrity", "FileVault", command("/usr/bin/fdesetup", ["status"]))
+        add(&e, "System integrity", "Device management enrollment", command("/usr/bin/profiles", ["status", "-type", "enrollment"]))
+        add(&e, "System integrity", "Secure boot and hardware overview", command("/usr/sbin/system_profiler", ["SPiBridgeDataType", "SPHardwareDataType", "-detailLevel", "mini"], timeout: 35))
+        add(&e, "Network", "Listening TCP services", command("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], timeout: 25))
+        add(&e, "Network", "Current network connections", command("/usr/sbin/netstat", ["-an", "-p", "tcp"]))
+        add(&e, "Network", "Sharing configuration", command("/usr/sbin/sharing", ["-l"]))
+        add(&e, "Monitoring", "Remote login service", command("/usr/sbin/systemsetup", ["-getremotelogin"]))
+        add(&e, "Persistence", "Background items", command("/usr/bin/sfltool", ["dumpbtm"], timeout: 25))
+        add(&e, "Persistence", "System launch services", command("/bin/launchctl", ["list"], timeout: 25))
+        add(&e, "Persistence", "User launch services", command("/bin/launchctl", ["list", "gui/\(getuid())"], timeout: 25))
+        add(&e, "Monitoring", "System extensions", command("/usr/bin/systemextensionsctl", ["list"]))
+        add(&e, "Monitoring", "Configuration profiles", command("/usr/bin/profiles", ["list", "-type", "configuration"]))
+        add(&e, "Updates", "Recent installer history", command("/usr/sbin/system_profiler", ["SPInstallHistoryDataType", "-detailLevel", "mini"], timeout: 35))
+        add(&e, "Logs", "Recent security and persistence log events", command("/usr/bin/log", ["show", "--last", "24h", "--style", "compact", "--info", "--predicate", "(eventMessage CONTAINS[c] 'launch' OR eventMessage CONTAINS[c] 'login item' OR eventMessage CONTAINS[c] 'screen recording' OR eventMessage CONTAINS[c] 'microphone' OR eventMessage CONTAINS[c] 'camera' OR eventMessage CONTAINS[c] 'profile' OR eventMessage CONTAINS[c] 'software update' OR eventMessage CONTAINS[c] 'amfi' OR eventMessage CONTAINS[c] 'signature')"], timeout: 35))
+        scanStartupFiles(into: &e)
+        add(&e, "Network", "Proxy settings", command("/usr/sbin/scutil", ["--proxy"]))
+        add(&e, "System integrity", "Firewall status", command("/usr/libexec/ApplicationFirewall/socketfilterfw", ["--getglobalstate"]))
+        return e
+    }
+
+    private func scanStartupFiles(into e: inout [Evidence]) {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let roots = [
+            URL(fileURLWithPath: "/Library/LaunchAgents"), URL(fileURLWithPath: "/Library/LaunchDaemons"),
+            home.appendingPathComponent("Library/LaunchAgents"),
+            URL(fileURLWithPath: "/Library/StartupItems"), URL(fileURLWithPath: "/System/Library/StartupItems"),
+            home.appendingPathComponent("Library/Application Support/Microsoft/Office/Startup"),
+            home.appendingPathComponent("Library/Group Containers/UBF8T346G9.Office/User Content/Startup")
+        ]
+        var rows: [String] = []
+        for root in roots {
+            guard let files = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { continue }
+            for file in files.prefix(250) {
+                let name = file.lastPathComponent.lowercased()
+                let isMacroPath = root.path.localizedCaseInsensitiveContains("Office")
+                if isMacroPath || file.pathExtension == "plist" {
+                    let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+                    rows.append("\(file.path) | modified \(values?.contentModificationDate?.description ?? "unknown")" + (isMacroPath ? " | Office startup location: review macros/add-ins" : ""))
+                    if rows.count >= 500 { break }
+                }
+                if ["update", "helper", "agent", "support", "sync", "monitor", "remote"].contains(where: name.contains) {
+                    rows.append("Name heuristic: \(file.path)")
+                }
+            }
+        }
+        add(&e, "Persistence", "Launch agents, daemons, and Office startup files", rows.joined(separator: "\n"), rows.isEmpty ? .info : .review)
+    }
+}
+
+@main
+struct MacSentinelApp: App {
+    @StateObject private var model = AuditModel()
+    init() { configureLogging() }
+    var body: some Scene {
+        WindowGroup {
+            ContentView().environmentObject(model).frame(minWidth: 760, minHeight: 620)
+        }.windowResizability(.contentSize)
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject private var model: AuditModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("MacSentinel").font(.largeTitle.bold())
+                    Text("Read-only endpoint evidence review").foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { model.run() } label: {
+                    Label(model.running ? "Scanning…" : "Run scan", systemImage: "viewfinder")
+                }.buttonStyle(.borderedProminent).disabled(model.running)
+                Button { model.export() } label: { Label("Export report", systemImage: "square.and.arrow.up") }
+                    .disabled(model.evidence.isEmpty)
+            }
+            if let lastRun = model.lastRun { Text("Last scan: \(lastRun.formatted(date: .abbreviated, time: .shortened))") .font(.caption).foregroundStyle(.secondary) }
+            HStack(spacing: 10) {
+                Label("Detection leads need review", systemImage: "checkmark.shield").font(.headline)
+                Spacer()
+                Text("Settings and files under review are not altered").font(.caption).foregroundStyle(.secondary)
+            }.padding(14).background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            Text("Checks persistence, Office startup locations, update history, network listeners, profiles, extensions, core security settings, and recent Unified Logs. A scan cannot prove a device is clean or validate firmware from user space.")
+                .font(.callout).foregroundStyle(.secondary)
+            if let error = model.error { Text(error).foregroundStyle(.red) }
+            if model.evidence.isEmpty && !model.running {
+                ContentUnavailableView("No scan yet", systemImage: "desktopcomputer.trianglebadge.exclamationmark", description: Text("Run a scan to collect a point-in-time evidence snapshot."))
+                Spacer()
+            } else {
+                List {
+                    ForEach(model.evidence) { item in
+                        DisclosureGroup {
+                            Text(item.detail).font(.system(.caption, design: .monospaced)).textSelection(.enabled).padding(.vertical, 5)
+                        } label: {
+                            HStack {
+                                Image(systemName: item.level == .concern ? "exclamationmark.triangle.fill" : item.level == .review ? "magnifyingglass" : "checkmark.circle")
+                                    .foregroundStyle(item.level == .concern ? .red : item.level == .review ? .orange : .secondary)
+                                VStack(alignment: .leading) {
+                                    Text(item.title).fontWeight(.medium)
+                                    Text(item.category).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }.listStyle(.inset)
+            }
+            Text("Some checks may be partial without administrator access or Full Disk Access. Review unexpected names, paths, publishers, and dates before drawing conclusions.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }.padding(22)
+    }
+}
