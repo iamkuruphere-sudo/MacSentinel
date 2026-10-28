@@ -29,7 +29,7 @@ A native SwiftUI macOS app for collecting a point-in-time, read-only security ev
 |---|---|
 | 🌐 **Official Portal** | [www.fullstopsolution.in/macsentinel.html](https://www.fullstopsolution.in/macsentinel.html) |
 | 🍏 **Direct DMG Download** | [MacSentinel-arm64.dmg](https://www.fullstopsolution.in/downloads/mac/MacSentinel-arm64.dmg) (v0.1.8 • 1.82 MiB) |
-| 🛡️ **SHA-256 Checksum** | `a3aa26a0f0d32569ff83bdc7afaea77c7682e0c0989a0f7021d1554900ff0786` |
+| 🛡️ **SHA-256 Checksum** | `0e878f246f53a1cf73e21ffe6fbd40496650e68ee501b8062174e64ffbdec681` |
 | 📦 **GitHub Releases** | [MacSentinel Releases](https://github.com/iamkuruphere-sudo/MacSentinel/releases) |
 | 🪟 **Cross-Platform Suite** | [Fullstop Desktop Suite](https://www.fullstopsolution.in/#desktop) |
 
