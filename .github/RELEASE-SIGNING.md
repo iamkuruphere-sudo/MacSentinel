@@ -6,7 +6,7 @@ The release workflow supports both **Apple Developer ID signed & notarized relea
 
 1. **Community / Open-Source Mode (Default)**:
    - When Apple signing secrets are not present, the workflow builds, packages, and signs the app bundle and DMG with an ad-hoc signature (`codesign --sign -`).
-   - The release notes provide clear instructions for macOS Gatekeeper so users can open the app (`xattr -cr /Applications/MacSentinel.app` or right-click -> Open).
+   - The release notes explain that ad-hoc signatures detect file changes but do not establish developer identity or satisfy Gatekeeper. They direct users to Finder's Control-click -> Open flow and do not recommend removing quarantine attributes.
    - This ensures releases and CI runs succeed without requiring a paid Apple Developer account.
 
 2. **Apple Developer ID Mode (Optional)**:
