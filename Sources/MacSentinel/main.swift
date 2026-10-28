@@ -1,7 +1,9 @@
 import SwiftUI
 import AppKit
+import Darwin
 import OSLog
 import CocoaLumberjackSwift
+import Security
 
 private let auditLog = Logger(subsystem: "local.macsentinel", category: "audit")
 
@@ -100,13 +102,24 @@ struct Scanner {
         }
     }
 
-    private func command(_ path: String, _ args: [String] = [], timeout: TimeInterval = 18) -> String {
+    private struct CommandResult {
+        let text: String
+        let isComplete: Bool
+    }
+
+    private func command(_ path: String, _ args: [String] = [], timeout: TimeInterval = 18) -> CommandResult {
         let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
         let out = Pipe(); let capture = BoundedCapture()
+        let outputClosed = DispatchSemaphore(value: 0)
         p.standardOutput = out; p.standardError = out
         out.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil } else { capture.append(chunk) }
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                outputClosed.signal()
+            } else {
+                capture.append(chunk)
+            }
         }
         do {
             try p.run()
@@ -115,16 +128,32 @@ struct Scanner {
             let deadline = Date().addingTimeInterval(timeout)
             while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
             let timedOut = p.isRunning
-            if timedOut { p.terminate(); p.waitUntilExit() }
+            if timedOut {
+                p.terminate()
+                let terminationDeadline = Date().addingTimeInterval(1)
+                while p.isRunning && Date() < terminationDeadline { Thread.sleep(forTimeInterval: 0.1) }
+                if p.isRunning { _ = kill(p.processIdentifier, SIGKILL) }
+                p.waitUntilExit()
+            }
+            let outputWasDrained = outputClosed.wait(timeout: .now() + 1) == .success
             out.fileHandleForReading.readabilityHandler = nil
-            capture.append(out.fileHandleForReading.readDataToEndOfFile())
             try? out.fileHandleForReading.close()
             let (data, truncated) = capture.result()
             var text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             if truncated { text += "\n[Command output capture limited to 64 KB.]" }
             if timedOut { text += "\n[Timed out; output may be incomplete.]" }
-            return text
-        } catch { return "Unavailable: \(error.localizedDescription)" }
+            if !outputWasDrained { text += "\n[Output stream did not close before the read deadline; output may be incomplete.]" }
+            if !timedOut && p.terminationStatus != 0 {
+                text += "\n[Command exited with status \(p.terminationStatus).]"
+            }
+            return CommandResult(text: text, isComplete: !timedOut && !truncated && outputWasDrained && p.terminationStatus == 0)
+        } catch {
+            return CommandResult(text: "Unavailable: \(error.localizedDescription)", isComplete: false)
+        }
+    }
+
+    private func add(_ out: inout [Evidence], _ category: String, _ title: String, _ result: CommandResult, _ level: Evidence.Level = .info) {
+        add(&out, category, title, result.text, result.isComplete ? level : .review)
     }
 
     private func add(_ out: inout [Evidence], _ category: String, _ title: String, _ detail: String, _ level: Evidence.Level = .info) {
@@ -152,11 +181,83 @@ struct Scanner {
         add(&e, "Monitoring", "System extensions", command("/usr/bin/systemextensionsctl", ["list"]))
         add(&e, "Monitoring", "Configuration profiles", command("/usr/bin/profiles", ["list", "-type", "configuration"]))
         add(&e, "Updates", "Recent installer history", command("/usr/sbin/system_profiler", ["SPInstallHistoryDataType", "-detailLevel", "mini"], timeout: 35))
+        add(&e, "Updates", "Available macOS software updates", command("/usr/sbin/softwareupdate", ["--list"], timeout: 60))
         add(&e, "Logs", "Recent security and persistence log events", command("/usr/bin/log", ["show", "--last", "24h", "--style", "compact", "--info", "--predicate", "(eventMessage CONTAINS[c] 'launch' OR eventMessage CONTAINS[c] 'login item' OR eventMessage CONTAINS[c] 'screen recording' OR eventMessage CONTAINS[c] 'microphone' OR eventMessage CONTAINS[c] 'camera' OR eventMessage CONTAINS[c] 'profile' OR eventMessage CONTAINS[c] 'software update' OR eventMessage CONTAINS[c] 'amfi' OR eventMessage CONTAINS[c] 'signature')"], timeout: 35))
         scanStartupFiles(into: &e)
+        scanInstalledApplications(into: &e)
         add(&e, "Network", "Proxy settings", command("/usr/sbin/scutil", ["--proxy"]))
         add(&e, "System integrity", "Firewall status", command("/usr/libexec/ApplicationFirewall/socketfilterfw", ["--getglobalstate"]))
         return e
+    }
+
+    private func scanInstalledApplications(into e: inout [Evidence]) {
+        let roots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        let maximumApplications = 100
+        var scanned = 0
+        var limited = false
+        var inaccessibleRoots: [String] = []
+
+        for root in roots {
+            guard FileManager.default.fileExists(atPath: root.path) else { continue }
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                inaccessibleRoots.append(root.path)
+                continue
+            }
+
+            while let url = enumerator.nextObject() as? URL {
+                guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
+                enumerator.skipDescendants()
+                if scanned == maximumApplications {
+                    limited = true
+                    break
+                }
+                scanned += 1
+
+                var staticCode: SecStaticCode?
+                let createStatus = SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &staticCode)
+                guard createStatus == errSecSuccess, let staticCode else {
+                    add(&e, "Application integrity", "\(url.deletingPathExtension().lastPathComponent) code signature",
+                        "\(url.path)\nCould not inspect code signature (OSStatus \(createStatus)).", .review)
+                    continue
+                }
+
+                let verificationStatus = SecStaticCodeCheckValidity(
+                    staticCode,
+                    SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate),
+                    nil
+                )
+                var signingInformation: CFDictionary?
+                _ = SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &signingInformation)
+                let info = signingInformation as? [String: Any] ?? [:]
+                let identifier = info[kSecCodeInfoIdentifier as String] as? String ?? "unknown"
+                let teamIdentifier = info[kSecCodeInfoTeamIdentifier as String] as? String ?? "none"
+                let isValid = verificationStatus == errSecSuccess
+                let statusText = isValid ? "Signature integrity valid" : "Signature missing or invalid (OSStatus \(verificationStatus))"
+                let detail = "\(url.path)\n\(statusText)\nIdentifier: \(identifier)\nTeam ID: \(teamIdentifier)\nA valid signature does not establish that an app is vulnerability-free or benign."
+                add(&e, "Application integrity", "\(url.deletingPathExtension().lastPathComponent) code signature", detail, isValid ? .info : .review)
+            }
+            if limited { break }
+        }
+
+        if scanned == 0 {
+            add(&e, "Application integrity", "Installed application signatures",
+                "No application bundles were found in /Applications or ~/Applications.", inaccessibleRoots.isEmpty ? .info : .review)
+        }
+        if limited {
+            add(&e, "Application integrity", "Application scan limit",
+                "The scan stopped after \(maximumApplications) application bundles. Additional applications were not checked.", .review)
+        }
+        if !inaccessibleRoots.isEmpty {
+            add(&e, "Application integrity", "Application scan coverage",
+                "Application directories could not be enumerated: \(inaccessibleRoots.joined(separator: ", "))", .review)
+        }
     }
 
     private func scanStartupFiles(into e: inout [Evidence]) {
@@ -170,8 +271,16 @@ struct Scanner {
             home.appendingPathComponent("Library/Group Containers/UBF8T346G9.Office/User Content/Startup")
         ]
         var rows: [String] = []
+        var inaccessibleRoots: [String] = []
+        var limitedRoots: [String] = []
+        var reachedRowLimit = false
         for root in roots {
-            guard let files = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { continue }
+            guard fm.fileExists(atPath: root.path) else { continue }
+            guard let files = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else {
+                inaccessibleRoots.append(root.path)
+                continue
+            }
+            if files.count > 250 { limitedRoots.append(root.path) }
             for file in files.prefix(250) {
                 let name = file.lastPathComponent.lowercased()
                 let isMacroPath = root.path.localizedCaseInsensitiveContains("Office")
@@ -183,9 +292,24 @@ struct Scanner {
                 if ["update", "helper", "agent", "support", "sync", "monitor", "remote"].contains(where: name.contains) {
                     rows.append("Name heuristic: \(file.path)")
                 }
+                if rows.count >= 500 {
+                    reachedRowLimit = true
+                    break
+                }
             }
+            if reachedRowLimit { break }
         }
-        add(&e, "Persistence", "Launch agents, daemons, and Office startup files", rows.joined(separator: "\n"), rows.isEmpty ? .info : .review)
+        var detail = rows.joined(separator: "\n")
+        if !inaccessibleRoots.isEmpty {
+            detail += "\nDirectories that could not be read: \(inaccessibleRoots.joined(separator: ", "))"
+        }
+        if !limitedRoots.isEmpty {
+            detail += "\nDirectories capped at 250 entries: \(limitedRoots.joined(separator: ", "))"
+        }
+        if reachedRowLimit { detail += "\nEvidence display stopped after 500 entries." }
+        let isPartial = !inaccessibleRoots.isEmpty || !limitedRoots.isEmpty || reachedRowLimit
+        let level: Evidence.Level = rows.isEmpty && !isPartial ? .info : .review
+        add(&e, "Persistence", "Launch agents, daemons, and Office startup files", detail, level)
     }
 }
 
