@@ -328,7 +328,7 @@ final class UpdateModel: ObservableObject {
     private var downloadedVersion: String?
     private var downloadedURL: URL?
 
-    private static let currentVersionFallback = "0.1.11"
+    private static let currentVersionFallback = "0.1.12"
     private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
     private static let dmgName = "MacSentinel-arm64.dmg"
 

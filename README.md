@@ -29,7 +29,7 @@ The downloadable app is built for Apple silicon (`arm64`) and includes the `Reso
 
 ## App updates
 
-MacSentinel checks the latest public GitHub Release on launch and every 24 hours while it is open. Use **Updates** in the app to check immediately. When a newer version-tagged release is available, the app downloads its Apple-silicon DMG to `~/Downloads` and verifies the SHA-256 digest reported by GitHub before making the file available to open. It does not replace the running app automatically: open the downloaded DMG, quit MacSentinel, then drag the app into Applications and confirm replacement. Updates are released from version tags; commits that have not been published as a GitHub Release are not offered by the updater.
+MacSentinel checks the latest public GitHub Release on launch and every 24 hours while it is open. Use **Updates** in the app to check immediately. When a newer version-tagged release is available, the app downloads its Apple-silicon DMG to `~/Downloads` and verifies the SHA-256 digest reported by GitHub before making the file available to open. This digest detects transfer corruption; it does not establish developer identity or make an ad-hoc build notarized or Gatekeeper-trusted. The app does not replace itself automatically: open the downloaded DMG, quit MacSentinel, then drag the app into Applications and confirm replacement. Updates are released from version tags; commits that have not been published as a GitHub Release are not offered by the updater.
 
 ## Boundaries and limitations
 
