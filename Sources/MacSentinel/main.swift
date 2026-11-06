@@ -522,6 +522,7 @@ final class UpdateModel: ObservableObject {
         case idle
         case checking
         case downloading(String)
+        case installing(String)
         case upToDate(String)
         case downloaded(version: String, url: URL)
         case failed(String)
@@ -532,7 +533,7 @@ final class UpdateModel: ObservableObject {
     private var downloadedVersion: String?
     private var downloadedURL: URL?
 
-    private static let currentVersionFallback = "0.1.17"
+    private static let currentVersionFallback = "0.1.18"
     private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
     private static let dmgName = "MacSentinel-arm64.dmg"
 
@@ -542,9 +543,14 @@ final class UpdateModel: ObservableObject {
 
     var isBusy: Bool {
         switch status {
-        case .checking, .downloading: true
+        case .checking, .downloading, .installing: true
         default: false
         }
+    }
+
+    var isInstalling: Bool {
+        if case .installing = status { return true }
+        return false
     }
 
     var buttonTitle: String {
@@ -579,10 +585,53 @@ final class UpdateModel: ObservableObject {
         status = .idle
     }
 
-    func openDownloadedDMG(at url: URL) {
-        guard NSWorkspace.shared.open(url) else {
-            status = .failed("The downloaded DMG is at \(url.path), but macOS could not open it.")
-            return
+    func installDownloadedUpdate() {
+        guard case let .downloaded(version, dmgURL) = status else { return }
+        status = .installing(version)
+
+        Task {
+            var stagedAppURL: URL?
+            do {
+                let preparedApp = try await Task.detached(priority: .userInitiated) {
+                    try UpdateInstallHelper.stageApp(from: dmgURL, expectedVersion: version)
+                }.value
+                stagedAppURL = preparedApp
+
+                guard let executablePath = Bundle.main.executablePath else {
+                    throw UpdateError.installationFailed("The running app executable could not be located.")
+                }
+
+                let helper = Process()
+                helper.executableURL = URL(fileURLWithPath: executablePath)
+                helper.arguments = [
+                    UpdateInstallHelper.commandLineFlag,
+                    preparedApp.path,
+                    String(ProcessInfo.processInfo.processIdentifier),
+                    version
+                ]
+                helper.standardOutput = FileHandle.nullDevice
+                helper.standardError = FileHandle.nullDevice
+                try helper.run()
+
+                do {
+                    try FileManager.default.removeItem(at: dmgURL)
+                } catch {
+                    auditLog.error("Could not remove the temporary update image: \(error.localizedDescription, privacy: .public)")
+                }
+                auditLog.notice("Staged MacSentinel update \(version) for installation")
+                NSApp.terminate(nil)
+            } catch {
+                var message = error.localizedDescription
+                if let stagedAppURL {
+                    do {
+                        try FileManager.default.removeItem(at: stagedAppURL.deletingLastPathComponent())
+                    } catch {
+                        message += " Temporary update files remain at \(stagedAppURL.deletingLastPathComponent().path): \(error.localizedDescription)"
+                    }
+                }
+                status = .failed(message)
+                auditLog.error("Update installation could not start: \(message, privacy: .public)")
+            }
         }
     }
 
@@ -657,20 +706,8 @@ final class UpdateModel: ObservableObject {
         let actualDigest = SHA256.hash(data: digestData).map { String(format: "%02x", $0) }.joined()
         guard actualDigest == expectedDigest else { throw UpdateError.checksumMismatch }
 
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
-        try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
-
-        var destination = downloads.appendingPathComponent("MacSentinel-\(version)-arm64.dmg")
-        if FileManager.default.fileExists(atPath: destination.path) {
-            let existingData = try Data(contentsOf: destination, options: [.mappedIfSafe])
-            let existingDigest = SHA256.hash(data: existingData).map { String(format: "%02x", $0) }.joined()
-            if existingDigest == expectedDigest {
-                try FileManager.default.removeItem(at: temporaryURL)
-                return destination
-            }
-            destination = downloads.appendingPathComponent("MacSentinel-\(version)-arm64-\(UUID().uuidString.prefix(8)).dmg")
-        }
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacSentinel-\(version)-\(UUID().uuidString).dmg")
         try FileManager.default.moveItem(at: temporaryURL, to: destination)
         return destination
     }
@@ -723,6 +760,7 @@ final class UpdateModel: ObservableObject {
         case invalidReleaseAsset
         case downloadFailed
         case checksumMismatch
+        case installationFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -732,6 +770,331 @@ final class UpdateModel: ObservableObject {
             case .invalidReleaseAsset: "The release asset URL or SHA-256 digest is missing or invalid."
             case .downloadFailed: "GitHub did not return the DMG successfully."
             case .checksumMismatch: "The downloaded DMG did not match GitHub's published SHA-256 digest."
+            case let .installationFailed(message): message
+            }
+        }
+    }
+}
+
+private enum UpdateInstallHelper {
+    static let commandLineFlag = "--macsentinel-install-helper"
+    private static let bundleIdentifier = "local.macsentinel"
+
+    @MainActor
+    static func runIfRequested() -> Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.count >= 5, arguments[1] == commandLineFlag else { return false }
+
+        do {
+            let actualParentPID = getppid()
+            guard let parentPID = pid_t(arguments[3]),
+                  parentPID > 1,
+                  parentPID != getpid(),
+                  actualParentPID == parentPID || actualParentPID == 1 else {
+                throw HelperError.invalidRequest
+            }
+            try waitForParentToExit(parentPID)
+
+            let stagedApp = URL(fileURLWithPath: arguments[2], isDirectory: true)
+            let version = arguments[4]
+            let executableURL = URL(fileURLWithPath: arguments[0]).standardizedFileURL
+            let derivedAppURL = executableURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let bundleURL = Bundle.main.bundleURL.standardizedFileURL
+            let installedApp = bundleURL.pathExtension == "app" ? bundleURL : derivedAppURL
+            guard let currentBundle = Bundle(url: installedApp),
+                  let currentVersion = currentBundle.infoDictionary?["CFBundleShortVersionString"] as? String,
+                  versionIsNewer(version, than: currentVersion) else {
+                throw HelperError.invalidRequest
+            }
+            try validateBundle(at: installedApp, expectedVersion: currentVersion)
+            let cleanupWarnings = try install(stagedApp: stagedApp, at: installedApp, expectedVersion: version)
+            presentRestartPrompt(version: version, appURL: installedApp, cleanupWarnings: cleanupWarnings)
+        } catch {
+            presentFailure(error.localizedDescription)
+        }
+        return true
+    }
+
+    static func stageApp(from dmgURL: URL, expectedVersion: String) throws -> URL {
+        let fileManager = FileManager.default
+        let stagingRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("MacSentinel-update-\(UUID().uuidString)", isDirectory: true)
+        let mountPoint = stagingRoot.appendingPathComponent("mount", isDirectory: true)
+        let stagedApp = stagingRoot.appendingPathComponent("MacSentinel.app", isDirectory: true)
+        try fileManager.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+
+        var mounted = false
+        do {
+            try run("/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mountPoint.path, dmgURL.path])
+            mounted = true
+
+            let sourceApp = mountPoint.appendingPathComponent("MacSentinel.app", isDirectory: true)
+            try validateBundle(at: sourceApp, expectedVersion: expectedVersion)
+            try fileManager.copyItem(at: sourceApp, to: stagedApp)
+            try validateBundle(at: stagedApp, expectedVersion: expectedVersion)
+            try run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-quiet"])
+            mounted = false
+            return stagedApp
+        } catch {
+            var cleanupFailures: [String] = []
+            if mounted {
+                do {
+                    try run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-quiet"])
+                } catch {
+                    cleanupFailures.append("The disk image may still be mounted at \(mountPoint.path): \(error.localizedDescription)")
+                }
+            }
+            do {
+                try fileManager.removeItem(at: stagingRoot)
+            } catch {
+                cleanupFailures.append("Temporary update files remain at \(stagingRoot.path): \(error.localizedDescription)")
+            }
+            if !cleanupFailures.isEmpty {
+                throw HelperError.installationFailed("\(error.localizedDescription) \(cleanupFailures.joined(separator: " "))")
+            }
+            throw error
+        }
+    }
+
+    @MainActor
+    private static func install(stagedApp: URL, at installedApp: URL, expectedVersion: String) throws -> [String] {
+        let fileManager = FileManager.default
+        let stagingRoot = stagedApp.deletingLastPathComponent().lastPathComponent
+        let temporaryRoot = fileManager.temporaryDirectory.standardizedFileURL.path + "/"
+        guard stagedApp.standardizedFileURL.path.hasPrefix(temporaryRoot),
+              stagedApp.lastPathComponent == "MacSentinel.app",
+              stagingRoot.hasPrefix("MacSentinel-update-"),
+              installedApp.pathExtension == "app",
+              fileManager.fileExists(atPath: installedApp.path) else {
+            throw HelperError.invalidRequest
+        }
+        try validateBundle(at: stagedApp, expectedVersion: expectedVersion)
+
+        let parent = installedApp.deletingLastPathComponent()
+        let replacement = parent.appendingPathComponent(".MacSentinel-update-\(UUID().uuidString).app")
+        let backup = parent.appendingPathComponent(".MacSentinel-backup-\(UUID().uuidString).app")
+        var originalMoved = false
+        var replacementInstalled = false
+        var cleanupWarnings: [String] = []
+
+        do {
+            try fileManager.copyItem(at: stagedApp, to: replacement)
+            try validateBundle(at: replacement, expectedVersion: expectedVersion)
+            try fileManager.moveItem(at: installedApp, to: backup)
+            originalMoved = true
+            try fileManager.moveItem(at: replacement, to: installedApp)
+            replacementInstalled = true
+            try validateBundle(at: installedApp, expectedVersion: expectedVersion)
+            do {
+                try fileManager.removeItem(at: backup)
+            } catch {
+                cleanupWarnings.append("The previous app copy remains at \(backup.path): \(error.localizedDescription)")
+            }
+            do {
+                try fileManager.removeItem(at: stagedApp.deletingLastPathComponent())
+            } catch {
+                cleanupWarnings.append("Temporary update files remain at \(stagedApp.deletingLastPathComponent().path): \(error.localizedDescription)")
+            }
+            return cleanupWarnings
+        } catch {
+            var rollbackFailure: String?
+            if replacementInstalled {
+                do {
+                    try fileManager.removeItem(at: installedApp)
+                } catch {
+                    rollbackFailure = "The new app could not be removed during rollback: \(error.localizedDescription)"
+                }
+            }
+            if originalMoved {
+                do {
+                    try fileManager.moveItem(at: backup, to: installedApp)
+                } catch {
+                    rollbackFailure = "The previous app is preserved at \(backup.path), but could not be restored automatically: \(error.localizedDescription)"
+                }
+            }
+            do {
+                if fileManager.fileExists(atPath: replacement.path) {
+                    try fileManager.removeItem(at: replacement)
+                }
+            } catch {
+                rollbackFailure = "Temporary replacement files remain at \(replacement.path): \(error.localizedDescription)"
+            }
+            if let rollbackFailure {
+                throw HelperError.installationFailed("\(error.localizedDescription) \(rollbackFailure)")
+            }
+            throw HelperError.installationFailed(error.localizedDescription)
+        }
+    }
+
+    private static func validateBundle(at url: URL, expectedVersion: String) throws {
+        guard let bundle = Bundle(url: url),
+              bundle.bundleIdentifier == bundleIdentifier,
+              validVersion(expectedVersion),
+              bundle.infoDictionary?["CFBundleShortVersionString"] as? String == expectedVersion,
+              let executableURL = bundle.executableURL,
+              FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw HelperError.invalidBundle
+        }
+        guard hasArm64Slice(at: executableURL) else { throw HelperError.invalidBundle }
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", url.path])
+    }
+
+    private static func hasArm64Slice(at executableURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: executableURL, options: [.mappedIfSafe]),
+              data.count >= 8 else { return false }
+
+        let magic = Array(data.prefix(4))
+        let cpuTypeArm64: UInt32 = 0x0100_000C
+        if magic == [0xCF, 0xFA, 0xED, 0xFE] {
+            return readUInt32(data, at: 4, littleEndian: true) == cpuTypeArm64
+        }
+        if magic == [0xFE, 0xED, 0xFA, 0xCF] {
+            return readUInt32(data, at: 4, littleEndian: false) == cpuTypeArm64
+        }
+
+        let littleEndian: Bool
+        let architectureSize: Int
+        switch magic {
+        case [0xCA, 0xFE, 0xBA, 0xBE]:
+            littleEndian = false
+            architectureSize = 20
+        case [0xBE, 0xBA, 0xFE, 0xCA]:
+            littleEndian = true
+            architectureSize = 20
+        case [0xCA, 0xFE, 0xBA, 0xBF]:
+            littleEndian = false
+            architectureSize = 32
+        case [0xBF, 0xBA, 0xFE, 0xCA]:
+            littleEndian = true
+            architectureSize = 32
+        default:
+            return false
+        }
+
+        guard let architectureCount = readUInt32(data, at: 4, littleEndian: littleEndian),
+              architectureCount > 0,
+              architectureCount <= 128 else { return false }
+        for index in 0..<Int(architectureCount) {
+            let offset = 8 + index * architectureSize
+            if readUInt32(data, at: offset, littleEndian: littleEndian) == cpuTypeArm64 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func readUInt32(_ data: Data, at offset: Int, littleEndian: Bool) -> UInt32? {
+        guard offset >= 0, offset + 4 <= data.count else { return nil }
+        let bytes = data[offset..<(offset + 4)]
+        if littleEndian {
+            return bytes.enumerated().reduce(UInt32(0)) { value, item in
+                value | (UInt32(item.element) << (item.offset * 8))
+            }
+        }
+        return bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+
+    private static func waitForParentToExit(_ pid: pid_t) throws {
+        let deadline = Date().addingTimeInterval(45)
+        while kill(pid, 0) == 0 {
+            guard Date() < deadline else { throw HelperError.parentDidNotExit }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
+    private static func validVersion(_ version: String) -> Bool {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        return (2...3).contains(parts.count)
+            && parts.allSatisfy { !$0.isEmpty && Int($0) != nil }
+    }
+
+    private static func versionIsNewer(_ candidate: String, than current: String) -> Bool {
+        guard validVersion(candidate), validVersion(current) else { return false }
+        let candidateParts = candidate.split(separator: ".").compactMap { Int($0) }
+        let currentParts = current.split(separator: ".").compactMap { Int($0) }
+        for index in 0..<max(candidateParts.count, currentParts.count) {
+            let newPart = index < candidateParts.count ? candidateParts[index] : 0
+            let oldPart = index < currentParts.count ? currentParts[index] : 0
+            if newPart != oldPart { return newPart > oldPart }
+        }
+        return false
+    }
+
+    private static func run(_ executable: String, _ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw HelperError.commandFailed(URL(fileURLWithPath: executable).lastPathComponent)
+        }
+    }
+
+    @MainActor
+    private static func presentRestartPrompt(version: String, appURL: URL, cleanupWarnings: [String]) {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "MacSentinel \(version) is installed"
+        let warningText = cleanupWarnings.isEmpty ? "" : "\n\n" + cleanupWarnings.joined(separator: "\n")
+        alert.informativeText = "The verified update has replaced the existing app. Restart MacSentinel now to use the new version?\(warningText)"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Restart Now")
+        alert.addButton(withTitle: "Later")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let launcher = Process()
+        launcher.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        launcher.arguments = ["-n", appURL.path]
+        launcher.standardOutput = FileHandle.nullDevice
+        launcher.standardError = FileHandle.nullDevice
+        do {
+            try launcher.run()
+            launcher.waitUntilExit()
+            if launcher.terminationStatus != 0 {
+                presentFailure("The update was installed, but macOS could not restart MacSentinel. Open it from Applications to use version \(version).")
+            }
+        } catch {
+            presentFailure("The update was installed, but macOS could not restart MacSentinel: \(error.localizedDescription)")
+        }
+    }
+
+    @MainActor
+    private static func presentFailure(_ message: String) {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "MacSentinel update could not be installed"
+        alert.informativeText = "\(message)\n\nThe installer attempts to preserve or restore the existing app if replacement fails."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private enum HelperError: LocalizedError {
+        case invalidRequest
+        case invalidBundle
+        case parentDidNotExit
+        case commandFailed(String)
+        case installationFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidRequest: "The update installer received an invalid request."
+            case .invalidBundle: "The downloaded app bundle is incomplete, has an unexpected version, or failed code-signature verification."
+            case .parentDidNotExit: "MacSentinel did not close in time, so the existing app was left unchanged."
+            case let .commandFailed(command): "macOS could not complete the \(command) update step."
+            case let .installationFailed(message): "The replacement failed: \(message)"
             }
         }
     }
@@ -995,7 +1358,12 @@ struct Scanner {
 struct MacSentinelApp: App {
     @StateObject private var model = AuditModel()
     @StateObject private var updater = UpdateModel()
-    init() { configureLogging() }
+    init() {
+        if UpdateInstallHelper.runIfRequested() {
+            exit(EXIT_SUCCESS)
+        }
+        configureLogging()
+    }
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -1010,6 +1378,7 @@ struct MacSentinelApp: App {
 private final class ContentViewState: ObservableObject {
     @Published var showingExport = false
     @Published var showingAbout = false
+    @Published var confirmingUpdateInstall = false
     @Published var expandedEvidenceID: UUID?
     @Published var confirmingHistoryClear = false
 }
@@ -1066,6 +1435,18 @@ struct ContentView: View {
                 model.export(redacted: redacted)
             }
         }
+        .confirmationDialog(
+            "Install MacSentinel update?",
+            isPresented: $viewState.confirmingUpdateInstall,
+            titleVisibility: .visible
+        ) {
+            Button("Install Update") {
+                updater.installDownloadedUpdate()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("MacSentinel will replace the existing app with the verified update and close during installation. When installation is complete, you will be asked whether to restart. The GitHub checksum and code signature verify file integrity; this community build is not notarized.")
+        }
         .task {
             updater.startAutomaticChecks()
             model.startScheduledScans()
@@ -1113,14 +1494,14 @@ struct ContentView: View {
             .tint(SentinelPalette.accent)
             .frame(width: 130)
             .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 9))
-            .disabled(model.running)
+            .disabled(model.running || updater.isInstalling)
             .help(model.selectedProfile.description)
 
             Button(action: { model.run() }) {
                 Label(model.running ? "Scanning…" : "Run scan", systemImage: "arrow.clockwise")
             }
             .buttonStyle(SentinelButtonStyle(variant: .primary))
-            .disabled(model.running)
+            .disabled(model.running || updater.isInstalling)
             .keyboardShortcut("r", modifiers: [.command])
 
             Button(action: updater.checkManually) {
@@ -1128,7 +1509,7 @@ struct ContentView: View {
             }
             .buttonStyle(SentinelButtonStyle(variant: .secondary))
             .disabled(updater.isBusy)
-            .help("Check GitHub Releases and download a newer MacSentinel DMG")
+            .help("Check GitHub Releases and install a verified newer MacSentinel version")
 
             Button {
                 viewState.showingExport = true
@@ -1136,7 +1517,7 @@ struct ContentView: View {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(SentinelButtonStyle(variant: .secondary))
-            .disabled(model.evidence.isEmpty || model.running)
+            .disabled(model.evidence.isEmpty || model.running || updater.isInstalling)
         }
     }
 
@@ -1216,11 +1597,12 @@ struct ContentView: View {
 
             Spacer(minLength: 8)
 
-            if case let .downloaded(_, url) = updater.status {
-                Button("Open DMG") {
-                    updater.openDownloadedDMG(at: url)
+            if case .downloaded = updater.status {
+                Button("Install Update") {
+                    viewState.confirmingUpdateInstall = true
                 }
-                .buttonStyle(SentinelButtonStyle(variant: .secondary))
+                .buttonStyle(SentinelButtonStyle(variant: .primary))
+                .disabled(model.running)
             } else if case .failed = updater.status {
                 Button("Retry") {
                     updater.checkManually()
@@ -1255,11 +1637,13 @@ struct ContentView: View {
         case .checking:
             ("arrow.triangle.2.circlepath", "Checking for updates", "Checking the latest MacSentinel release on GitHub.", .secondary)
         case let .downloading(version):
-            ("arrow.down.circle", "Downloading MacSentinel \(version)", "The DMG is being downloaded and its GitHub-published SHA-256 digest will be verified.", .accentColor)
+            ("arrow.down.circle", "Downloading MacSentinel \(version)", "The DMG is being downloaded. Its GitHub-published SHA-256 digest will be verified before installation.", SentinelPalette.accent)
+        case let .installing(version):
+            ("arrow.triangle.2.circlepath", "Installing MacSentinel \(version)", "Preparing the verified app bundle. MacSentinel will close during replacement.", SentinelPalette.accent)
         case let .upToDate(version):
             ("checkmark.circle", "MacSentinel is up to date", "Running version \(version); no newer GitHub release was found.", .secondary)
-        case let .downloaded(version, url):
-            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. This community build is not notarized and may prompt Gatekeeper; proceed only if you trust the source. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", SentinelPalette.accent)
+        case let .downloaded(version, _):
+            ("checkmark.seal", "MacSentinel \(version) is ready", "The release checksum is verified. Install it into the current app location; you will be prompted to restart MacSentinel when replacement is complete.", SentinelPalette.accent)
         case let .failed(message):
             ("exclamationmark.triangle", "Update check failed", "\(message) Your current app was not changed.", SentinelPalette.review)
         }
