@@ -31,6 +31,7 @@ Use the semantic role colors consistently in charts, labels, and actions. Never 
 - **Secondary button:** raised graphite fill and visible outline for updates, retries, and follow-up actions.
 - **Quiet and destructive actions:** quiet controls stay low-emphasis; destructive actions use coral text and require confirmation where appropriate.
 - **Action rows:** full-width, keyboard-accessible buttons with clear pressed feedback and an outline.
+- **About:** a compact dark sheet shows the bundle marketing version, publisher attribution, local-data summary, and verified repository, release, issue-reporting, and publisher links.
 - **Panels:** graphite surfaces with a thin outline, 16-point corner radius, and consistent 18-point internal spacing.
 - **Scan chart:** horizontal standard-stacked bars show only actual evidence counts per scan area, split into collected, review, and attention series. A legend names each state.
 - **Theme:** dark appearance is intentional and applied throughout the window and its sheets. Native controls retain their standard keyboard and accessibility behavior.

@@ -532,7 +532,7 @@ final class UpdateModel: ObservableObject {
     private var downloadedVersion: String?
     private var downloadedURL: URL?
 
-    private static let currentVersionFallback = "0.1.16"
+    private static let currentVersionFallback = "0.1.17"
     private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
     private static let dmgName = "MacSentinel-arm64.dmg"
 
@@ -1009,6 +1009,7 @@ struct MacSentinelApp: App {
 @MainActor
 private final class ContentViewState: ObservableObject {
     @Published var showingExport = false
+    @Published var showingAbout = false
     @Published var expandedEvidenceID: UUID?
     @Published var confirmingHistoryClear = false
 }
@@ -1081,8 +1082,21 @@ struct ContentView: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("MacSentinel")
-                    .font(.title2.weight(.semibold))
+                HStack(spacing: 6) {
+                    Text("MacSentinel")
+                        .font(.title2.weight(.semibold))
+                    Button {
+                        viewState.showingAbout = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(SentinelButtonStyle(variant: .quiet))
+                    .accessibilityLabel("About MacSentinel")
+                    .help("About MacSentinel")
+                    .sheet(isPresented: $viewState.showingAbout) {
+                        AboutView()
+                    }
+                }
                 Text("Read-only security evidence")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -1913,6 +1927,105 @@ private extension Evidence.Level {
         case .review: "Review"
         case .concern: "Attention"
         }
+    }
+}
+
+private enum AppVersion {
+    static var display: String {
+        guard let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+              !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Development build"
+        }
+        return version
+    }
+}
+
+private enum AboutLinks {
+    static let repository = URL(string: "https://github.com/iamkuruphere-sudo/MacSentinel")!
+    static let releases = URL(string: "https://github.com/iamkuruphere-sudo/MacSentinel/releases")!
+    static let reportIssue = URL(string: "https://github.com/iamkuruphere-sudo/MacSentinel/issues/new")!
+    static let publisher = URL(string: "https://www.fullstopsolution.in")!
+}
+
+private struct AboutView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 14) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundStyle(SentinelPalette.accent)
+                    .frame(width: 58, height: 58)
+                    .background(SentinelPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("MacSentinel")
+                        .font(.title2.weight(.semibold))
+                    Text("Version \(AppVersion.display)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(SentinelPalette.secondaryText)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Published by Fullstop Solution")
+                    .font(.subheadline.weight(.semibold))
+                Link("fullstopsolution.in", destination: AboutLinks.publisher)
+                    .font(.subheadline)
+                    .tint(SentinelPalette.accent)
+            }
+
+            Text("MacSentinel collects read-only security evidence. Scan history stays on this Mac; scan results are not uploaded by the app.")
+                .font(.callout)
+                .foregroundStyle(SentinelPalette.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 9) {
+                aboutLink("GitHub repository", symbol: "chevron.left.forwardslash.chevron.right", destination: AboutLinks.repository)
+                aboutLink("Releases and updates", symbol: "arrow.down.circle", destination: AboutLinks.releases)
+                aboutLink("Report an issue", symbol: "bubble.left", destination: AboutLinks.reportIssue)
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }
+                    .buttonStyle(SentinelButtonStyle(variant: .primary))
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+        .background(SentinelPalette.canvas)
+        .preferredColorScheme(.dark)
+    }
+
+    private func aboutLink(_ title: String, symbol: String, destination: URL) -> some View {
+        Link(destination: destination) {
+            HStack(spacing: 10) {
+                Image(systemName: symbol)
+                    .frame(width: 18)
+                    .accessibilityHidden(true)
+                Text(title)
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(SentinelPalette.muted)
+                    .accessibilityHidden(true)
+            }
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(SentinelPalette.primaryText)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 11)
+            .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(SentinelPalette.outline, lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
     }
 }
 
