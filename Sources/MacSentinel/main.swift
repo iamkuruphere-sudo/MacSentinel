@@ -223,7 +223,9 @@ struct AuditReport: Codable {
 struct EvidenceCategory: Identifiable {
     let name: String
     let count: Int
+    let collectedCount: Int
     let reviewCount: Int
+    let attentionCount: Int
     var id: String { name }
 }
 
@@ -277,6 +279,10 @@ final class AuditModel: ObservableObject {
         evidence.filter { $0.level != .info }.count
     }
 
+    var collectedCount: Int {
+        evidence.filter { $0.level == .info }.count
+    }
+
     var concernCount: Int {
         evidence.filter { $0.level == .concern }.count
     }
@@ -287,7 +293,9 @@ final class AuditModel: ObservableObject {
                 EvidenceCategory(
                     name: name,
                     count: items.count,
-                    reviewCount: items.filter { $0.level != .info }.count
+                    collectedCount: items.filter { $0.level == .info }.count,
+                    reviewCount: items.filter { $0.level == .review }.count,
+                    attentionCount: items.filter { $0.level == .concern }.count
                 )
             }
             .sorted {
@@ -524,7 +532,7 @@ final class UpdateModel: ObservableObject {
     private var downloadedVersion: String?
     private var downloadedURL: URL?
 
-    private static let currentVersionFallback = "0.1.15"
+    private static let currentVersionFallback = "0.1.16"
     private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
     private static let dmgName = "MacSentinel-arm64.dmg"
 
@@ -1022,7 +1030,7 @@ struct ContentView: View {
                 if let historyWarning = model.historyWarning {
                     Label(historyWarning, systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(SentinelPalette.review)
                         .textSelection(.enabled)
                 }
 
@@ -1041,7 +1049,9 @@ struct ContentView: View {
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .top)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(SentinelPalette.canvas.ignoresSafeArea())
+        .tint(SentinelPalette.accent)
+        .preferredColorScheme(.dark)
         .alert("Could not export report", isPresented: Binding(
             get: { model.error != nil },
             set: { if !$0 { model.error = nil } }
@@ -1065,9 +1075,9 @@ struct ContentView: View {
         HStack(spacing: 16) {
             Image(systemName: "checkmark.shield.fill")
                 .font(.system(size: 28, weight: .medium))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(SentinelPalette.accent)
                 .frame(width: 52, height: 52)
-                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                .background(SentinelPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -1078,7 +1088,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Spacer(minLength: 16)
+            Spacer(minLength: 12)
 
             Picker("Scan profile", selection: $model.selectedProfile) {
                 ForEach(ScanProfile.allCases) { profile in
@@ -1086,21 +1096,23 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.menu)
-            .frame(width: 138)
+            .tint(SentinelPalette.accent)
+            .frame(width: 130)
+            .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 9))
             .disabled(model.running)
             .help(model.selectedProfile.description)
 
             Button(action: { model.run() }) {
                 Label(model.running ? "Scanning…" : "Run scan", systemImage: "arrow.clockwise")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(SentinelButtonStyle(variant: .primary))
             .disabled(model.running)
             .keyboardShortcut("r", modifiers: [.command])
 
             Button(action: updater.checkManually) {
                 Label(updater.buttonTitle, systemImage: "arrow.down.circle")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(SentinelButtonStyle(variant: .secondary))
             .disabled(updater.isBusy)
             .help("Check GitHub Releases and download a newer MacSentinel DMG")
 
@@ -1109,7 +1121,7 @@ struct ContentView: View {
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(SentinelButtonStyle(variant: .secondary))
             .disabled(model.evidence.isEmpty || model.running)
         }
     }
@@ -1134,7 +1146,9 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.menu)
-                .frame(width: 110)
+                .tint(SentinelPalette.accent)
+                .frame(width: 104)
+                .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 9))
                 .disabled(model.running)
             }
 
@@ -1146,6 +1160,7 @@ struct ContentView: View {
                     }
                 ))
                 .toggleStyle(.switch)
+                .tint(SentinelPalette.accent)
                 .disabled(model.schedule == .off)
 
                 Spacer()
@@ -1160,7 +1175,7 @@ struct ContentView: View {
             if let settingsError = model.settingsError {
                 Text(settingsError)
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(SentinelPalette.review)
                     .textSelection(.enabled)
             }
         }
@@ -1191,12 +1206,12 @@ struct ContentView: View {
                 Button("Open DMG") {
                     updater.openDownloadedDMG(at: url)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SentinelButtonStyle(variant: .secondary))
             } else if case .failed = updater.status {
                 Button("Retry") {
                     updater.checkManually()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SentinelButtonStyle(variant: .secondary))
                 .disabled(updater.isBusy)
             }
 
@@ -1206,16 +1221,16 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "xmark")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(SentinelButtonStyle(variant: .quiet))
                 .accessibilityLabel("Dismiss update status")
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        .background(SentinelPalette.surface, in: RoundedRectangle(cornerRadius: 12))
         .overlay {
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(copy.tint.opacity(0.18), lineWidth: 1)
+                .strokeBorder(SentinelPalette.outline, lineWidth: 1)
         }
     }
 
@@ -1230,9 +1245,9 @@ struct ContentView: View {
         case let .upToDate(version):
             ("checkmark.circle", "MacSentinel is up to date", "Running version \(version); no newer GitHub release was found.", .secondary)
         case let .downloaded(version, url):
-            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. This community build is not notarized and may prompt Gatekeeper; proceed only if you trust the source. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", .green)
+            ("checkmark.seal", "MacSentinel \(version) is ready", "Saved as \(url.lastPathComponent) in Downloads. This community build is not notarized and may prompt Gatekeeper; proceed only if you trust the source. Open the DMG, quit MacSentinel, then drag the app to Applications to replace it.", SentinelPalette.accent)
         case let .failed(message):
-            ("exclamationmark.triangle", "Update check failed", "\(message) Your current app was not changed.", .orange)
+            ("exclamationmark.triangle", "Update check failed", "\(message) Your current app was not changed.", SentinelPalette.review)
         }
     }
 
@@ -1245,10 +1260,14 @@ struct ContentView: View {
             Button(action: { model.run() }) {
                 Label("Run first scan", systemImage: "viewfinder")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(SentinelButtonStyle(variant: .primary))
         }
         .frame(maxWidth: .infinity, minHeight: 420)
-        .background(.background, in: RoundedRectangle(cornerRadius: 18))
+        .background(SentinelPalette.surface, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .strokeBorder(SentinelPalette.outline, lineWidth: 1)
+        }
         .overlay(alignment: .bottom) {
             Text("MacSentinel gathers evidence; it does not determine that a Mac is clean.")
                 .font(.caption)
@@ -1271,7 +1290,11 @@ struct ContentView: View {
             }
             .padding(22)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.background, in: RoundedRectangle(cornerRadius: 16))
+            .background(SentinelPalette.surface, in: RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(SentinelPalette.outline, lineWidth: 1)
+            }
 
             if !model.evidence.isEmpty {
                 dashboard
@@ -1302,10 +1325,10 @@ struct ContentView: View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: model.concernCount > 0 ? "exclamationmark.triangle.fill" : "doc.text.magnifyingglass")
                 .font(.title2)
-                .foregroundStyle(model.concernCount > 0 ? Color.red : Color.accentColor)
+                .foregroundStyle(model.concernCount > 0 ? SentinelPalette.attention : SentinelPalette.accent)
                 .frame(width: 42, height: 42)
                 .background(
-                    (model.concernCount > 0 ? Color.red : Color.accentColor).opacity(0.10),
+                    (model.concernCount > 0 ? SentinelPalette.attention : SentinelPalette.accent).opacity(0.12),
                     in: RoundedRectangle(cornerRadius: 12)
                 )
                 .accessibilityHidden(true)
@@ -1331,10 +1354,10 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background, in: RoundedRectangle(cornerRadius: 16))
+        .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 16))
         .overlay {
             RoundedRectangle(cornerRadius: 16)
-                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+                .strokeBorder(SentinelPalette.outline, lineWidth: 1)
         }
     }
 
@@ -1358,46 +1381,68 @@ struct ContentView: View {
                 value: "\(model.reviewCount)",
                 detail: "Evidence items",
                 symbol: "magnifyingglass",
-                tint: model.reviewCount > 0 ? .orange : .secondary
+                tint: model.reviewCount > 0 ? SentinelPalette.review : SentinelPalette.muted
             )
             MetricTile(
                 title: "Collected",
-                value: "\(model.evidence.count)",
+                value: "\(model.collectedCount)",
                 detail: "Evidence items",
                 symbol: "doc.text",
-                tint: .blue
+                tint: SentinelPalette.accent
             )
             MetricTile(
                 title: "Categories",
                 value: "\(model.categories.count)",
                 detail: "Areas inspected",
                 symbol: "square.grid.2x2",
-                tint: .teal
+                tint: SentinelPalette.accent
             )
         }
     }
 
     private var categoryPanel: some View {
         VStack(alignment: .leading, spacing: 16) {
-            panelHeading("Evidence by category", subtitle: "Select a category to filter results.")
+            panelHeading("Areas scanned", subtitle: "Real scan results grouped by area. Review flags need context.")
 
             if model.categories.isEmpty {
                 Text("No category data was returned.")
                     .foregroundStyle(.secondary)
             } else {
-                Chart(model.categories) { category in
-                    BarMark(
-                        x: .value("Evidence items", category.count),
-                        y: .value("Category", category.name),
-                        height: 16
-                    )
-                    .foregroundStyle(category.reviewCount > 0 ? Color.orange.gradient : Color.accentColor.gradient)
-                    .cornerRadius(5)
+                Chart {
+                    ForEach(model.categories) { category in
+                        BarMark(
+                            x: .value("Collected", category.collectedCount),
+                            y: .value("Scan area", category.name),
+                            height: 14,
+                            stacking: .standard
+                        )
+                        .foregroundStyle(by: .value("Result", "Collected"))
+
+                        BarMark(
+                            x: .value("Review", category.reviewCount),
+                            y: .value("Scan area", category.name),
+                            height: 14,
+                            stacking: .standard
+                        )
+                        .foregroundStyle(by: .value("Result", "Review"))
+
+                        BarMark(
+                            x: .value("Attention", category.attentionCount),
+                            y: .value("Scan area", category.name),
+                            height: 14,
+                            stacking: .standard
+                        )
+                        .foregroundStyle(by: .value("Result", "Attention"))
+                    }
                 }
                 .chartLegend(.hidden)
+                .chartForegroundStyleScale(
+                    domain: ["Collected", "Review", "Attention"],
+                    range: [SentinelPalette.accent, SentinelPalette.review, SentinelPalette.attention]
+                )
                 .chartXAxis {
                     AxisMarks(position: .bottom, values: .automatic(desiredCount: 4)) { value in
-                        AxisGridLine()
+                        AxisGridLine().foregroundStyle(SentinelPalette.outline)
                         AxisValueLabel()
                     }
                 }
@@ -1407,9 +1452,19 @@ struct ContentView: View {
                     }
                 }
                 .frame(height: max(150, CGFloat(model.categories.count) * 32))
-                .accessibilityLabel("Evidence items grouped by category")
+                .accessibilityLabel("Scan areas split into collected evidence, review items, and attention items")
 
-                Divider()
+                HStack(spacing: 16) {
+                    statusLegend("Collected", color: SentinelPalette.accent)
+                    statusLegend("Review", color: SentinelPalette.review)
+                    statusLegend("Attention", color: SentinelPalette.attention)
+                    Spacer(minLength: 0)
+                    Text("\(model.categories.count) areas · \(model.evidence.count) checks")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(SentinelPalette.muted)
+                }
+
+                Divider().overlay(SentinelPalette.outline)
 
                 HStack {
                     Picker("Filter evidence", selection: $model.selectedCategory) {
@@ -1419,18 +1474,32 @@ struct ContentView: View {
                         }
                     }
                     .pickerStyle(.menu)
+                    .tint(SentinelPalette.accent)
                     .labelsHidden()
                     .accessibilityLabel("Filter evidence by category")
 
                     Spacer()
 
-                    Text("\(model.evidence.count) total")
+                    Text("\(model.reviewCount) need review")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
         }
         .panelStyle()
+    }
+
+    private func statusLegend(_ title: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(SentinelPalette.secondaryText)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private var actionCenterPanel: some View {
@@ -1454,7 +1523,7 @@ struct ContentView: View {
                     } label: {
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: item.level == .concern ? "exclamationmark.triangle.fill" : "magnifyingglass")
-                                .foregroundStyle(item.level == .concern ? Color.red : Color.orange)
+                                .foregroundStyle(item.level == .concern ? SentinelPalette.attention : SentinelPalette.review)
                                 .frame(width: 18)
                                 .padding(.top, 2)
                             VStack(alignment: .leading, spacing: 3) {
@@ -1475,7 +1544,7 @@ struct ContentView: View {
                                 HStack(spacing: 8) {
                                     Text(item.level == .concern ? "Attention" : "Verify")
                                         .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(item.level == .concern ? Color.red : Color.orange)
+                                        .foregroundStyle(item.level == .concern ? SentinelPalette.attention : SentinelPalette.review)
                                     if let guidance = item.guidance {
                                         Text("Estimated effort: \(guidance.estimatedEffort)")
                                             .font(.caption2)
@@ -1491,7 +1560,7 @@ struct ContentView: View {
                         }
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(SentinelButtonStyle(variant: .row))
                     .accessibilityHint("Opens the evidence details and suggested steps.")
                 }
 
@@ -1514,7 +1583,7 @@ struct ContentView: View {
                 Button("Clear history", role: .destructive) {
                     viewState.confirmingHistoryClear = true
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(SentinelButtonStyle(variant: .danger))
                 .disabled(model.history.isEmpty)
             }
 
@@ -1538,7 +1607,7 @@ struct ContentView: View {
             ForEach(Array(model.history.prefix(5))) { snapshot in
                 HStack(spacing: 10) {
                     Image(systemName: snapshot.concernCount > 0 ? "exclamationmark.triangle" : "doc.text.magnifyingglass")
-                        .foregroundStyle(snapshot.concernCount > 0 ? Color.red : Color.secondary)
+                        .foregroundStyle(snapshot.concernCount > 0 ? SentinelPalette.attention : SentinelPalette.accent)
                         .frame(width: 18)
                     Text(snapshot.generatedAt.formatted(date: .abbreviated, time: .shortened))
                         .font(.caption)
@@ -1581,7 +1650,7 @@ struct ContentView: View {
 
                 if model.selectedCategory != nil {
                     Button("Clear filter") { model.selectedCategory = nil }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(SentinelButtonStyle(variant: .quiet))
                 }
 
                 Text("\(model.visibleEvidence.count)")
@@ -1671,10 +1740,10 @@ private struct MetricTile: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background, in: RoundedRectangle(cornerRadius: 14))
+        .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
         .overlay {
             RoundedRectangle(cornerRadius: 14)
-                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+                .strokeBorder(SentinelPalette.outline, lineWidth: 1)
         }
         .accessibilityElement(children: .combine)
     }
@@ -1695,9 +1764,9 @@ private struct EvidenceRow: View {
 
     private var tint: Color {
         switch item.level {
-        case .info: .secondary
-        case .review: .orange
-        case .concern: .red
+        case .info: SentinelPalette.accent
+        case .review: SentinelPalette.review
+        case .concern: SentinelPalette.attention
         }
     }
 
@@ -1726,12 +1795,16 @@ private struct EvidenceRow: View {
                         }
                     }
                     Button("Rescan after changes", action: onRescan)
-                        .buttonStyle(.bordered)
+                        .buttonStyle(SentinelButtonStyle(variant: .secondary))
                         .disabled(isExpanded == false)
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                .background(SentinelPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(SentinelPalette.outline, lineWidth: 1)
+                }
                 .padding(.vertical, 8)
             }
 
@@ -1762,9 +1835,11 @@ private struct EvidenceRow: View {
                     .font(.caption)
                     .foregroundStyle(tint)
             }
-            .padding(.vertical, 9)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
             .contentShape(Rectangle())
         }
+        .tint(SentinelPalette.accent)
         .accessibilityHint("Shows the collected command output and details.")
     }
 }
@@ -1802,18 +1877,19 @@ private struct ReportExportSheet: View {
                     .font(.subheadline)
                 Text("This may contain sensitive device information. Review the saved file before sharing it with support.")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(SentinelPalette.review)
             }
 
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
+                    .buttonStyle(SentinelButtonStyle(variant: .secondary))
                     .keyboardShortcut(.cancelAction)
                 Button("Save JSON…") {
                     export(state.redacted)
                     dismiss()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(SentinelButtonStyle(variant: .primary))
                 .keyboardShortcut(.defaultAction)
             }
         }
@@ -1840,14 +1916,97 @@ private extension Evidence.Level {
     }
 }
 
+/*
+THESIS: Treat each scan as a precise evidence instrument, not a safety-score display.
+OWN-WORLD: Ink-black canvas, raised graphite surfaces, ice-teal actions, and amber/coral result states.
+STORY: Show what was inspected, separate collected results from review and attention items, then guide the next step.
+FIRST VIEWPORT: Native controls and scan state lead; an evidence-split area chart and prioritized review sit immediately below.
+FORM: macOS SwiftUI operations dashboard, retaining native navigation and controls while replacing the default light surface with a focused dark instrument panel.
+*/
+private enum SentinelPalette {
+    static let canvas = Color(red: 0.035, green: 0.043, blue: 0.055)
+    static let surface = Color(red: 0.075, green: 0.090, blue: 0.110)
+    static let surfaceRaised = Color(red: 0.105, green: 0.125, blue: 0.150)
+    static let outline = Color(red: 0.180, green: 0.215, blue: 0.250)
+    static let accent = Color(red: 0.300, green: 0.870, blue: 0.790)
+    static let review = Color(red: 1.000, green: 0.735, blue: 0.340)
+    static let attention = Color(red: 1.000, green: 0.405, blue: 0.390)
+    static let primaryText = Color(red: 0.930, green: 0.950, blue: 0.965)
+    static let secondaryText = Color(red: 0.690, green: 0.735, blue: 0.775)
+    static let muted = Color(red: 0.520, green: 0.580, blue: 0.635)
+}
+
+private struct SentinelButtonStyle: ButtonStyle {
+    enum Variant: Equatable {
+        case primary
+        case secondary
+        case quiet
+        case danger
+        case row
+    }
+
+    @Environment(\.isEnabled) private var isEnabled
+    let variant: Variant
+
+    func makeBody(configuration: Configuration) -> some View {
+        let radius: CGFloat = variant == .row ? 9 : 10
+        return configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, variant == .row ? 10 : 13)
+            .padding(.vertical, variant == .row ? 9 : 8)
+            .frame(maxWidth: variant == .row ? .infinity : nil, alignment: variant == .row ? .leading : .center)
+            .background(backgroundColor(isPressed: configuration.isPressed), in: RoundedRectangle(cornerRadius: radius))
+            .overlay {
+                if variant == .secondary || variant == .row {
+                    RoundedRectangle(cornerRadius: radius)
+                        .strokeBorder(
+                            variant == .row && configuration.isPressed
+                                ? SentinelPalette.accent.opacity(0.40)
+                                : SentinelPalette.outline,
+                            lineWidth: 1
+                        )
+                }
+            }
+            .opacity(isEnabled ? 1 : 0.45)
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
+            .contentShape(RoundedRectangle(cornerRadius: radius))
+    }
+
+    private var foregroundColor: Color {
+        switch variant {
+        case .primary: SentinelPalette.canvas
+        case .secondary, .row: SentinelPalette.primaryText
+        case .quiet: SentinelPalette.secondaryText
+        case .danger: SentinelPalette.attention
+        }
+    }
+
+    private func backgroundColor(isPressed: Bool) -> Color {
+        switch variant {
+        case .primary:
+            isPressed ? SentinelPalette.accent.opacity(0.80) : SentinelPalette.accent
+        case .secondary:
+            isPressed ? SentinelPalette.accent.opacity(0.20) : SentinelPalette.surfaceRaised
+        case .quiet:
+            isPressed ? SentinelPalette.surfaceRaised : .clear
+        case .danger:
+            isPressed ? SentinelPalette.attention.opacity(0.22) : SentinelPalette.attention.opacity(0.10)
+        case .row:
+            isPressed ? SentinelPalette.surfaceRaised : .clear
+        }
+    }
+}
+
 private extension View {
     func panelStyle() -> some View {
         padding(18)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.background, in: RoundedRectangle(cornerRadius: 16))
+            .background(SentinelPalette.surface, in: RoundedRectangle(cornerRadius: 16))
             .overlay {
                 RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+                    .strokeBorder(SentinelPalette.outline, lineWidth: 1)
             }
     }
 }
