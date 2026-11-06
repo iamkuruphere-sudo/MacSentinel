@@ -11,7 +11,11 @@ A native SwiftUI macOS app for collecting a point-in-time, read-only security ev
 - Common launch-agent and launch-daemon folders plus Microsoft Office startup folders, where macro or add-in autoloading may occur.
 - Installer history and selected recent macOS Unified Log events related to persistence, privacy permissions, update activity, and code-signing.
 
-The dashboard turns each scan into an evidence-first overview with review counts, category breakdowns, evidence-linked next steps, and expandable command results. Suggestions explain practical settings or verification steps for recognized results; they do not change the Mac automatically, and ambiguous evidence is explicitly presented as something to investigate rather than a malware verdict. It does not calculate a security score or label a device clean.
+The dashboard offers **Quick check** and **Full scan** profiles. Quick check covers core platform protections, network exposure, common launch-service inventory, proxy, and firewall state. Full scan adds application-signature inspection, detailed security logs, startup folders, installer history, system extensions, and the remaining checks. The action center prioritizes attention items, explains why they may matter, provides estimated-effort guidance, and offers a rescan after the user reviews or applies steps. MacSentinel never changes settings or removes software automatically.
+
+Up to 20 scan snapshots are saved locally in `~/Library/Application Support/MacSentinel/scan-history.json`. The dashboard compares review items across scans of the same profile and can clear saved history. Snapshots can include machine details and paths returned by macOS; they are not uploaded by MacSentinel. Optional daily or weekly scans run only while the app remains open. Change notifications are opt-in and require macOS notification permission.
+
+The export dialog defaults to a redacted JSON support report containing the date, macOS version, profile, categories, statuses, explanations, and suggested steps. It omits the Mac name, evidence titles, file paths, and raw command output. Full evidence JSON remains available when needed and can contain sensitive device details; inspect either report before sharing. The dashboard does not calculate a security score or label a device clean.
 
 Items are evidence to inspect, not verdicts. Legitimate software commonly uses launch services, network connections, profiles, privacy permissions, and update helpers. Application signatures are checked for cryptographic integrity; a valid signature does not establish that an app is benign or free of vulnerabilities. The scanner does not perform publisher reputation checks, malware signature matching, CVE-to-version matching, or compare the operating system against a known-good baseline.
 
@@ -19,7 +23,7 @@ Application signature checks recursively inspect application bundles found under
 
 ## Logging
 
-The app uses CocoaLumberjack to write its own audit lifecycle events to Unified Logging and a rotating local log file (daily rotation, up to seven files). It also reads selected existing events through Apple's `log show` command. Audit outputs can contain private paths and machine details; JSON export is explicit and saved only to the location the user chooses.
+The app uses CocoaLumberjack to write its own audit lifecycle events to Unified Logging and a rotating local log file (daily rotation, up to seven files). It also reads selected existing events through Apple's `log show` command during a full scan. Audit outputs can contain private paths and machine details; full JSON export is explicit and saved only to the location the user chooses.
 
 ## Build and run
 

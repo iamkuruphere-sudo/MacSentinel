@@ -6,6 +6,7 @@ import CryptoKit
 import OSLog
 import CocoaLumberjackSwift
 import Security
+import UserNotifications
 
 @MainActor private let auditLog = Logger(subsystem: "local.macsentinel", category: "audit")
 
@@ -214,6 +215,7 @@ struct AuditReport: Codable {
     let generatedAt: Date
     let host: String
     let macOS: String
+    let profile: ScanProfile
     let evidence: [Evidence]
     let limitations: [String]
 }
@@ -230,8 +232,46 @@ final class AuditModel: ObservableObject {
     @Published var running = false
     @Published var evidence: [Evidence] = []
     @Published var lastRun: Date?
+    @Published private(set) var lastRunProfile: ScanProfile = .full
     @Published var error: String?
     @Published var selectedCategory: String?
+    @Published var selectedProfile: ScanProfile {
+        didSet { UserDefaults.standard.set(selectedProfile.rawValue, forKey: "scanProfile") }
+    }
+    @Published private(set) var schedule: ScanSchedule
+    @Published private(set) var notificationsEnabled: Bool
+    @Published private(set) var nextScheduledRun: Date?
+    @Published private(set) var history: [ScanSnapshot] = []
+    @Published private(set) var scanDiff: ScanDiff?
+    @Published private(set) var historyWarning: String?
+    @Published var settingsError: String?
+
+    private let historyStore = ScanHistoryStore()
+    private var scheduleTask: Task<Void, Never>?
+    private var lastRunWasScheduled = false
+
+    init() {
+        let defaults = UserDefaults.standard
+        selectedProfile = ScanProfile(rawValue: defaults.string(forKey: "scanProfile") ?? "") ?? .full
+        schedule = ScanSchedule(rawValue: defaults.string(forKey: "scanSchedule") ?? "") ?? .off
+        notificationsEnabled = defaults.bool(forKey: "scanNotificationsEnabled")
+        nextScheduledRun = defaults.object(forKey: "nextScheduledRun") as? Date
+
+        do {
+            history = try historyStore.load()
+            if let latest = history.first {
+                evidence = latest.evidence
+                lastRun = latest.generatedAt
+                lastRunProfile = latest.profile
+                scanDiff = ScanDiff(
+                    previous: history.dropFirst().first { $0.profile == latest.profile },
+                    current: latest
+                )
+            }
+        } catch {
+            historyWarning = "Saved scan history could not be loaded: \(error.localizedDescription)"
+        }
+    }
 
     var reviewCount: Int {
         evidence.filter { $0.level != .info }.count
@@ -276,39 +316,195 @@ final class AuditModel: ObservableObject {
             }
     }
 
-    func run() {
+    func run(isScheduled: Bool = false) {
         guard !running else { return }
         running = true
         error = nil
         selectedCategory = nil
+        historyWarning = nil
+        lastRunWasScheduled = isScheduled
+        let profile = selectedProfile
         DDLogInfo("Read-only endpoint audit started")
-        auditLog.notice("Read-only endpoint audit started")
+        auditLog.notice("Read-only endpoint audit started with \(profile.rawValue, privacy: .public) profile")
         Task.detached(priority: .userInitiated) {
-            let findings = Scanner().scan()
-            await MainActor.run {
-                self.evidence = findings
-                self.lastRun = Date()
-                self.running = false
-                DDLogInfo("Audit finished with \(findings.count) evidence items")
-                auditLog.notice("Audit finished with \(findings.count) evidence items")
+            let findings = Scanner().scan(profile: profile)
+            await self.completeScan(findings, profile: profile)
+        }
+    }
+
+    private func completeScan(_ findings: [Evidence], profile: ScanProfile) async {
+        let generatedAt = Date()
+        let snapshot = ScanSnapshot(generatedAt: generatedAt, profile: profile, evidence: findings)
+        let previous = history.first { $0.profile == profile }
+        scanDiff = ScanDiff(previous: previous, current: snapshot)
+        evidence = findings
+        lastRun = generatedAt
+        lastRunProfile = profile
+        selectedProfile = profile
+        history.insert(snapshot, at: 0)
+        history = Array(history.prefix(20))
+        running = false
+
+        do {
+            try historyStore.save(history)
+        } catch {
+            historyWarning = "This scan is available now, but local history could not be saved: \(error.localizedDescription)"
+        }
+
+        if lastRunWasScheduled, notificationsEnabled {
+            await notifyAboutChanges(scanDiff)
+        }
+        if let interval = schedule.interval {
+            setNextScheduledRun(Date().addingTimeInterval(interval))
+        }
+        DDLogInfo("Audit finished with \(findings.count) evidence items")
+        auditLog.notice("Audit finished with \(findings.count) evidence items")
+    }
+
+    func startScheduledScans() {
+        guard schedule != .off else { return }
+        if nextScheduledRun == nil {
+            setNextScheduledRun(Date().addingTimeInterval(schedule.interval ?? 86_400))
+        }
+        startScheduleLoop()
+    }
+
+    func setSchedule(_ newSchedule: ScanSchedule) {
+        schedule = newSchedule
+        UserDefaults.standard.set(newSchedule.rawValue, forKey: "scanSchedule")
+        guard let interval = newSchedule.interval else {
+            scheduleTask?.cancel()
+            scheduleTask = nil
+            nextScheduledRun = nil
+            UserDefaults.standard.removeObject(forKey: "nextScheduledRun")
+            return
+        }
+        setNextScheduledRun(Date().addingTimeInterval(interval))
+        startScheduleLoop()
+    }
+
+    func setNotificationsEnabled(_ enabled: Bool) async {
+        guard enabled else {
+            notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: "scanNotificationsEnabled")
+            settingsError = nil
+            return
+        }
+
+        do {
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+            guard granted else {
+                settingsError = "macOS did not allow notifications. Enable them for MacSentinel in System Settings > Notifications, then try again."
+                return
+            }
+            notificationsEnabled = true
+            UserDefaults.standard.set(true, forKey: "scanNotificationsEnabled")
+            settingsError = nil
+        } catch {
+            settingsError = "Could not request notification permission: \(error.localizedDescription)"
+        }
+    }
+
+    func clearHistory() {
+        let previousHistory = history
+        history = []
+        scanDiff = nil
+        do {
+            try historyStore.save([])
+            historyWarning = nil
+        } catch {
+            history = previousHistory
+            historyWarning = "Could not clear local scan history: \(error.localizedDescription)"
+        }
+    }
+
+    func export(redacted: Bool) {
+        let generatedAt = lastRun ?? Date()
+        let snapshot = ScanSnapshot(generatedAt: generatedAt, profile: lastRunProfile, evidence: evidence)
+        let panel = NSSavePanel()
+        let prefix = redacted ? "MacSentinel-Support" : "MacSentinel-Evidence"
+        panel.nameFieldStringValue = "\(prefix)-\(ISO8601DateFormatter().string(from: generatedAt).prefix(10)).json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data: Data
+            if redacted {
+                data = try encoder.encode(RedactedAuditReport(
+                    snapshot: snapshot,
+                    macOS: ProcessInfo.processInfo.operatingSystemVersionString
+                ))
+            } else {
+                let report = AuditReport(
+                    generatedAt: generatedAt,
+                    host: Host.current().localizedName ?? "Mac",
+                    macOS: ProcessInfo.processInfo.operatingSystemVersionString,
+                    profile: lastRunProfile,
+                    evidence: evidence,
+                    limitations: Scanner.limitations
+                )
+                data = try encoder.encode(report)
+            }
+            try data.write(to: url, options: .atomic)
+            DDLogInfo("Evidence report exported")
+            auditLog.notice("Evidence report exported with redaction: \(redacted, privacy: .public)")
+        } catch { self.error = "Could not save report: \(error.localizedDescription)" }
+    }
+
+    private func setNextScheduledRun(_ date: Date) {
+        nextScheduledRun = date
+        UserDefaults.standard.set(date, forKey: "nextScheduledRun")
+    }
+
+    private func startScheduleLoop() {
+        scheduleTask?.cancel()
+        scheduleTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.schedule != .off, let nextRun = self.nextScheduledRun else { return }
+                do {
+                    try await Task.sleep(for: .seconds(max(0, nextRun.timeIntervalSinceNow)))
+                } catch {
+                    return
+                }
+                while self.running && !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: .seconds(2))
+                    } catch {
+                        return
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                self.run(isScheduled: true)
+                while self.running && !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: .seconds(2))
+                    } catch {
+                        return
+                    }
+                }
             }
         }
     }
 
-    func export() {
-        let report = AuditReport(generatedAt: lastRun ?? Date(), host: Host.current().localizedName ?? "Mac",
-                                 macOS: ProcessInfo.processInfo.operatingSystemVersionString,
-                                 evidence: evidence, limitations: Scanner.limitations)
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "MacSentinel-Evidence-\(ISO8601DateFormatter().string(from: report.generatedAt).prefix(10)).json"
-        panel.allowedContentTypes = [.json]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+    private func notifyAboutChanges(_ difference: ScanDiff?) async {
+        guard let difference else { return }
+        let added = difference.added.count
+        let resolved = difference.resolved.count
+        let changed = difference.changed.count
+        guard added + resolved + changed > 0 else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "MacSentinel scan changes"
+        content.body = "\(added) new review item(s), \(resolved) resolved, \(changed) changed. Open MacSentinel to review the evidence."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         do {
-            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
-            try encoder.encode(report).write(to: url, options: .atomic)
-            DDLogInfo("Evidence report exported")
-            auditLog.notice("Evidence report exported")
-        } catch { self.error = "Could not save report: \(error.localizedDescription)" }
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            settingsError = "The scheduled scan finished, but macOS could not show its notification: \(error.localizedDescription)"
+        }
     }
 }
 
@@ -328,7 +524,7 @@ final class UpdateModel: ObservableObject {
     private var downloadedVersion: String?
     private var downloadedURL: URL?
 
-    private static let currentVersionFallback = "0.1.12"
+    private static let currentVersionFallback = "0.1.13"
     private static let latestReleaseURL = URL(string: "https://api.github.com/repos/iamkuruphere-sudo/MacSentinel/releases/latest")!
     private static let dmgName = "MacSentinel-arm64.dmg"
 
@@ -628,31 +824,38 @@ struct Scanner {
         ))
     }
 
-    func scan() -> [Evidence] {
+    func scan(profile: ScanProfile = .full) -> [Evidence] {
         var e: [Evidence] = []
+        let profileDetail = profile == .quick
+            ? "Quick check includes core platform protections, exposure, common persistence inventory, proxy, and firewall state. It skips application-signature inspection, detailed security logs, and installer history."
+            : "Full scan includes all available checks, including application-signature inspection, detailed security logs, startup folders, and installer history."
+        add(&e, "Scan coverage", profile.title, profileDetail)
         add(&e, "System integrity", "System Integrity Protection", command("/usr/bin/csrutil", ["status"]))
         add(&e, "System integrity", "Gatekeeper assessment", command("/usr/sbin/spctl", ["--status"]))
-        add(&e, "System integrity", "Sealed system volume", command("/usr/bin/csrutil", ["authenticated-root", "status"]))
-        add(&e, "System integrity", "Nonstandard boot arguments", command("/usr/sbin/nvram", ["boot-args"]))
         add(&e, "System integrity", "FileVault", command("/usr/bin/fdesetup", ["status"]))
         add(&e, "System integrity", "Device management enrollment", command("/usr/bin/profiles", ["status", "-type", "enrollment"]))
-        add(&e, "System integrity", "Secure boot and hardware overview", command("/usr/sbin/system_profiler", ["SPiBridgeDataType", "SPHardwareDataType", "-detailLevel", "mini"], timeout: 35))
         add(&e, "Network", "Listening TCP services", command("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], timeout: 25))
-        add(&e, "Network", "Current network connections", command("/usr/sbin/netstat", ["-an", "-p", "tcp"]))
         add(&e, "Network", "Sharing configuration", command("/usr/sbin/sharing", ["-l"]))
         add(&e, "Monitoring", "Remote login service", command("/usr/sbin/systemsetup", ["-getremotelogin"]))
         add(&e, "Persistence", "Background items", command("/usr/bin/sfltool", ["dumpbtm"], timeout: 25))
         add(&e, "Persistence", "System launch services", command("/bin/launchctl", ["list"], timeout: 25))
         add(&e, "Persistence", "User launch services", command("/bin/launchctl", ["list", "gui/\(getuid())"], timeout: 25))
-        add(&e, "Monitoring", "System extensions", command("/usr/bin/systemextensionsctl", ["list"]))
         add(&e, "Monitoring", "Configuration profiles", command("/usr/bin/profiles", ["list", "-type", "configuration"]))
-        add(&e, "Updates", "Recent installer history", command("/usr/sbin/system_profiler", ["SPInstallHistoryDataType", "-detailLevel", "mini"], timeout: 35))
-        add(&e, "Updates", "Available macOS software updates", command("/usr/sbin/softwareupdate", ["--list"], timeout: 60))
-        add(&e, "Logs", "Recent security and persistence log events", command("/usr/bin/log", ["show", "--last", "24h", "--style", "compact", "--info", "--predicate", "(eventMessage CONTAINS[c] 'launch' OR eventMessage CONTAINS[c] 'login item' OR eventMessage CONTAINS[c] 'screen recording' OR eventMessage CONTAINS[c] 'microphone' OR eventMessage CONTAINS[c] 'camera' OR eventMessage CONTAINS[c] 'profile' OR eventMessage CONTAINS[c] 'software update' OR eventMessage CONTAINS[c] 'amfi' OR eventMessage CONTAINS[c] 'signature')"], timeout: 35))
-        scanStartupFiles(into: &e)
-        scanInstalledApplications(into: &e)
         add(&e, "Network", "Proxy settings", command("/usr/sbin/scutil", ["--proxy"]))
         add(&e, "System integrity", "Firewall status", command("/usr/libexec/ApplicationFirewall/socketfilterfw", ["--getglobalstate"]))
+
+        if profile == .full {
+            add(&e, "System integrity", "Sealed system volume", command("/usr/bin/csrutil", ["authenticated-root", "status"]))
+            add(&e, "System integrity", "Nonstandard boot arguments", command("/usr/sbin/nvram", ["boot-args"]))
+            add(&e, "System integrity", "Secure boot and hardware overview", command("/usr/sbin/system_profiler", ["SPiBridgeDataType", "SPHardwareDataType", "-detailLevel", "mini"], timeout: 35))
+            add(&e, "Network", "Current network connections", command("/usr/sbin/netstat", ["-an", "-p", "tcp"]))
+            add(&e, "Monitoring", "System extensions", command("/usr/bin/systemextensionsctl", ["list"]))
+            add(&e, "Updates", "Recent installer history", command("/usr/sbin/system_profiler", ["SPInstallHistoryDataType", "-detailLevel", "mini"], timeout: 35))
+            add(&e, "Updates", "Available macOS software updates", command("/usr/sbin/softwareupdate", ["--list"], timeout: 60))
+            add(&e, "Logs", "Recent security and persistence log events", command("/usr/bin/log", ["show", "--last", "24h", "--style", "compact", "--info", "--predicate", "(eventMessage CONTAINS[c] 'launch' OR eventMessage CONTAINS[c] 'login item' OR eventMessage CONTAINS[c] 'screen recording' OR eventMessage CONTAINS[c] 'microphone' OR eventMessage CONTAINS[c] 'camera' OR eventMessage CONTAINS[c] 'profile' OR eventMessage CONTAINS[c] 'software update' OR eventMessage CONTAINS[c] 'amfi' OR eventMessage CONTAINS[c] 'signature')"], timeout: 35))
+            scanStartupFiles(into: &e)
+            scanInstalledApplications(into: &e)
+        }
         return e
     }
 
@@ -796,9 +999,17 @@ struct MacSentinelApp: App {
 }
 
 @MainActor
+private final class ContentViewState: ObservableObject {
+    @Published var showingExport = false
+    @Published var expandedEvidenceID: UUID?
+    @Published var confirmingHistoryClear = false
+}
+
+@MainActor
 struct ContentView: View {
     @EnvironmentObject private var model: AuditModel
     @EnvironmentObject private var updater: UpdateModel
+    @StateObject private var viewState = ContentViewState()
 
     var body: some View {
         ScrollView {
@@ -807,11 +1018,21 @@ struct ContentView: View {
                 if updater.status != .idle {
                     updateBanner
                 }
+                scanSettingsPanel
+                if let historyWarning = model.historyWarning {
+                    Label(historyWarning, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
 
                 if model.running {
                     scanningState
                 } else if model.evidence.isEmpty {
-                    emptyState
+                    VStack(alignment: .leading, spacing: 18) {
+                        emptyState
+                        privacyCoveragePanel
+                    }
                 } else {
                     dashboard
                 }
@@ -829,8 +1050,14 @@ struct ContentView: View {
         } message: {
             Text(model.error ?? "")
         }
+        .sheet(isPresented: $viewState.showingExport) {
+            ReportExportSheet { redacted in
+                model.export(redacted: redacted)
+            }
+        }
         .task {
             updater.startAutomaticChecks()
+            model.startScheduledScans()
         }
     }
 
@@ -853,7 +1080,17 @@ struct ContentView: View {
 
             Spacer(minLength: 16)
 
-            Button(action: model.run) {
+            Picker("Scan profile", selection: $model.selectedProfile) {
+                ForEach(ScanProfile.allCases) { profile in
+                    Text(profile.title).tag(profile)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(width: 138)
+            .disabled(model.running)
+            .help(model.selectedProfile.description)
+
+            Button(action: { model.run() }) {
                 Label(model.running ? "Scanning…" : "Run scan", systemImage: "arrow.clockwise")
             }
             .buttonStyle(.borderedProminent)
@@ -867,12 +1104,67 @@ struct ContentView: View {
             .disabled(updater.isBusy)
             .help("Check GitHub Releases and download a newer MacSentinel DMG")
 
-            Button(action: model.export) {
+            Button {
+                viewState.showingExport = true
+            } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(.bordered)
             .disabled(model.evidence.isEmpty || model.running)
         }
+    }
+
+    private var scanSettingsPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Scheduled scans")
+                        .font(.headline)
+                    Text("Scans run only while MacSentinel is open.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Picker("Frequency", selection: Binding(
+                    get: { model.schedule },
+                    set: { model.setSchedule($0) }
+                )) {
+                    ForEach(ScanSchedule.allCases) { schedule in
+                        Text(schedule.title).tag(schedule)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 110)
+                .disabled(model.running)
+            }
+
+            HStack(alignment: .center) {
+                Toggle("Notify me about changes after scheduled scans", isOn: Binding(
+                    get: { model.notificationsEnabled },
+                    set: { enabled in
+                        Task { await model.setNotificationsEnabled(enabled) }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .disabled(model.schedule == .off)
+
+                Spacer()
+
+                if let nextRun = model.nextScheduledRun, model.schedule != .off {
+                    Text("Next: \(nextRun.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let settingsError = model.settingsError {
+                Text(settingsError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
+        }
+        .panelStyle()
     }
 
     private var updateBanner: some View {
@@ -950,7 +1242,7 @@ struct ContentView: View {
         } description: {
             Text("Run a local, read-only scan to collect system, network, persistence, and application-signature evidence.")
         } actions: {
-            Button(action: model.run) {
+            Button(action: { model.run() }) {
                 Label("Run first scan", systemImage: "viewfinder")
             }
             .buttonStyle(.borderedProminent)
@@ -997,11 +1289,12 @@ struct ContentView: View {
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 16)], alignment: .leading, spacing: 16) {
                 categoryPanel
-                reviewPanel
+                actionCenterPanel
             }
 
+            scanHistoryPanel
             evidencePanel
-            limitationsNote
+            privacyCoveragePanel
         }
     }
 
@@ -1025,7 +1318,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 if let lastRun = model.lastRun {
                     Label {
-                        Text("Scanned \(lastRun.formatted(date: .abbreviated, time: .shortened)) · \(Host.current().localizedName ?? "This Mac")")
+                        Text("Scanned \(lastRun.formatted(date: .abbreviated, time: .shortened)) · \(model.lastRunProfile.title) · \(Host.current().localizedName ?? "This Mac")")
                     } icon: {
                         Image(systemName: "clock")
                     }
@@ -1140,13 +1433,13 @@ struct ContentView: View {
         .panelStyle()
     }
 
-    private var reviewPanel: some View {
+    private var actionCenterPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             panelHeading(
-                "Review & response",
+                "Priority actions",
                 subtitle: model.reviewCount == 0
-                    ? "No items are currently marked for review."
-                    : "Evidence-linked next steps. MacSentinel never changes settings for you."
+                    ? "No evidence is currently marked for review."
+                    : "Start with attention items. Effort is an estimate; review flags need context."
             )
 
             if model.reviewEvidence.isEmpty {
@@ -1154,9 +1447,10 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 8)
             } else {
-                ForEach(Array(model.reviewEvidence.prefix(4))) { item in
+                ForEach(Array(model.reviewEvidence.prefix(5))) { item in
                     Button {
                         model.selectedCategory = item.category
+                        viewState.expandedEvidenceID = item.id
                     } label: {
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: item.level == .concern ? "exclamationmark.triangle.fill" : "magnifyingglass")
@@ -1178,6 +1472,17 @@ struct ContentView: View {
                                         .foregroundStyle(.secondary)
                                         .lineLimit(2)
                                 }
+                                HStack(spacing: 8) {
+                                    Text(item.level == .concern ? "Attention" : "Verify")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(item.level == .concern ? Color.red : Color.orange)
+                                    if let guidance = item.guidance {
+                                        Text("Estimated effort: \(guidance.estimatedEffort)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.top, 2)
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "chevron.right")
@@ -1187,11 +1492,11 @@ struct ContentView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityHint("Filters the evidence list to \(item.category).")
+                    .accessibilityHint("Opens the evidence details and suggested steps.")
                 }
 
-                if model.reviewCount > 4 {
-                    Text("+ \(model.reviewCount - 4) more items in the full evidence list")
+                if model.reviewCount > 5 {
+                    Text("+ \(model.reviewCount - 5) more items in the full evidence list")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.top, 2)
@@ -1199,6 +1504,66 @@ struct ContentView: View {
             }
         }
         .panelStyle()
+    }
+
+    private var scanHistoryPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                panelHeading("Scan history & changes", subtitle: "The latest 20 snapshots stay on this Mac; history is never uploaded.")
+                Spacer()
+                Button("Clear history", role: .destructive) {
+                    viewState.confirmingHistoryClear = true
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.history.isEmpty)
+            }
+
+            if model.history.count > 1, let difference = model.scanDiff {
+                HStack(spacing: 12) {
+                    Label("\(difference.added.count) new", systemImage: "plus.circle")
+                    Label("\(difference.resolved.count) resolved", systemImage: "checkmark.circle")
+                    Label("\(difference.changed.count) changed", systemImage: "arrow.left.arrow.right")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text("Compared with \(difference.previousDate.formatted(date: .abbreviated, time: .shortened)). A change in evidence is not by itself a security verdict.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Run another scan with the same profile to compare evidence over time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(Array(model.history.prefix(5))) { snapshot in
+                HStack(spacing: 10) {
+                    Image(systemName: snapshot.concernCount > 0 ? "exclamationmark.triangle" : "doc.text.magnifyingglass")
+                        .foregroundStyle(snapshot.concernCount > 0 ? Color.red : Color.secondary)
+                        .frame(width: 18)
+                    Text(snapshot.generatedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .frame(minWidth: 150, alignment: .leading)
+                    Text(snapshot.profile.title)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(snapshot.reviewCount) review")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .panelStyle()
+        .confirmationDialog(
+            "Clear all saved scan history?",
+            isPresented: $viewState.confirmingHistoryClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear History", role: .destructive) { model.clearHistory() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes saved snapshots from this Mac. The current scan remains visible until you close the app.")
+        }
     }
 
     private var evidencePanel: some View {
@@ -1228,7 +1593,14 @@ struct ContentView: View {
 
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(model.visibleEvidence.enumerated()), id: \.element.id) { index, item in
-                    EvidenceRow(item: item)
+                    EvidenceRow(
+                        item: item,
+                        isExpanded: Binding(
+                            get: { viewState.expandedEvidenceID == item.id },
+                            set: { viewState.expandedEvidenceID = $0 ? item.id : nil }
+                        ),
+                        onRescan: { model.run() }
+                    )
                     if index < model.visibleEvidence.count - 1 {
                         Divider().padding(.leading, 32)
                     }
@@ -1238,18 +1610,21 @@ struct ContentView: View {
         .panelStyle()
     }
 
-    private var limitationsNote: some View {
+    private var privacyCoveragePanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Read this snapshot in context", systemImage: "info.circle")
+            Label("Privacy & scan coverage", systemImage: "hand.raised")
                 .font(.subheadline.weight(.semibold))
-            Text("MacSentinel is a read-only triage tool, not antivirus software. Protected data may be unavailable, and a valid application signature does not establish that software is safe.")
+            Text("Scan commands run locally. Saved history can contain device names, file paths, and command output; it is stored in this Mac's Application Support folder and can be cleared above. Nothing in the scan is uploaded.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("Unexpected names, paths, permissions, and connections are leads to investigate—not findings of malicious activity.")
+            Text("Quick checks cover core protections, network exposure, common launch services, proxies, and firewall state. Full scans also inspect application signatures, startup folders, installer history, system extensions, and selected recent logs. Protected data may still be unavailable.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("MacSentinel does not match malware signatures, check third-party CVEs, or prove that a Mac is clean. Findings and change summaries are leads to verify, not verdicts.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 4)
+        .panelStyle()
     }
 
     private func panelHeading(_ title: String, subtitle: String) -> some View {
@@ -1307,6 +1682,8 @@ private struct MetricTile: View {
 
 private struct EvidenceRow: View {
     let item: Evidence
+    @Binding var isExpanded: Bool
+    let onRescan: () -> Void
 
     private var symbol: String {
         switch item.level {
@@ -1325,13 +1702,18 @@ private struct EvidenceRow: View {
     }
 
     var body: some View {
-        DisclosureGroup {
+        DisclosureGroup(isExpanded: $isExpanded) {
             if let guidance = item.guidance {
                 VStack(alignment: .leading, spacing: 8) {
-                    Label("Suggested next steps", systemImage: "lightbulb")
+                    Label("Guided next steps", systemImage: "lightbulb")
                         .font(.subheadline.weight(.semibold))
+                    Text("Why it matters")
+                        .font(.caption.weight(.semibold))
                     Text(guidance.summary)
                         .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Estimated effort: \(guidance.estimatedEffort). This estimate varies by Mac and account setup.")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                     ForEach(Array(guidance.steps.enumerated()), id: \.offset) { index, step in
                         HStack(alignment: .top, spacing: 8) {
@@ -1343,6 +1725,9 @@ private struct EvidenceRow: View {
                                 .textSelection(.enabled)
                         }
                     }
+                    Button("Rescan after changes", action: onRescan)
+                        .buttonStyle(.bordered)
+                        .disabled(isExpanded == false)
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1381,6 +1766,59 @@ private struct EvidenceRow: View {
             .contentShape(Rectangle())
         }
         .accessibilityHint("Shows the collected command output and details.")
+    }
+}
+
+@MainActor
+private final class ReportExportState: ObservableObject {
+    @Published var redacted = true
+}
+
+@MainActor
+private struct ReportExportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var state = ReportExportState()
+    let export: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Export security report")
+                .font(.title3.weight(.semibold))
+
+            Picker("Report type", selection: $state.redacted) {
+                Text("Redacted support report").tag(true)
+                Text("Full evidence JSON").tag(false)
+            }
+            .pickerStyle(.segmented)
+
+            if state.redacted {
+                Text("Includes scan date, macOS version, profile, evidence categories and statuses, explanations, and suggested steps.")
+                    .font(.subheadline)
+                Text("Excludes the Mac's name, evidence titles, file paths, and raw command output. Review the saved file before sharing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Includes the Mac's name, evidence titles, detailed command output, and any file paths or account names returned by macOS.")
+                    .font(.subheadline)
+                Text("This may contain sensitive device information. Review the saved file before sharing it with support.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save JSON…") {
+                    export(state.redacted)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 520)
     }
 }
 
