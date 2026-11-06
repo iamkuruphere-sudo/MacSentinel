@@ -77,11 +77,18 @@ struct ScanDiff: Sendable {
         guard let previous, previous.profile == current.profile else { return nil }
         previousDate = previous.generatedAt
 
+        func comparisonKey(for item: Evidence) -> String {
+            let detailIdentity = item.category == "Application integrity"
+                ? item.detail.components(separatedBy: .newlines).first ?? ""
+                : ""
+            return "\(item.category)|\(item.title)|\(detailIdentity)"
+        }
+
         let oldReview = previous.evidence.reduce(into: [String: Evidence]()) { result, item in
-            if item.level != .info { result["\(item.category)|\(item.title)"] = item }
+            if item.level != .info { result[comparisonKey(for: item)] = item }
         }
         let newReview = current.evidence.reduce(into: [String: Evidence]()) { result, item in
-            if item.level != .info { result["\(item.category)|\(item.title)"] = item }
+            if item.level != .info { result[comparisonKey(for: item)] = item }
         }
 
         let addedItems = newReview.compactMap { entry -> Evidence? in

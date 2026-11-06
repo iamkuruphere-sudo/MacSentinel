@@ -26,9 +26,16 @@ jobs:
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [ -n "${APPLE_CERTIFICATE_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+          if [ -n "${APPLE_CERTIFICATE_BASE64:-}" ] \
+            && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] \
+            && [ -n "${APPLE_ID:-}" ] \
+            && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] \
+            && [ -n "${APPLE_TEAM_ID:-}" ]; then
             echo "Configuring Apple Developer ID signing identity..."
             KEYCHAIN_PATH="$RUNNER_TEMP/macsentinel-signing.keychain-db"
             KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
@@ -53,7 +60,7 @@ jobs:
           fi
 
           echo "has_developer_id=false" >> "$GITHUB_OUTPUT"
-          echo "No Apple Developer ID certificate configured. Falling back to ad-hoc signing for open-source distribution."
+          echo "Complete Apple Developer ID and notarization secrets are not configured. Falling back to ad-hoc signing for open-source distribution."
 
       - name: Build Apple silicon executable
         run: swift build -c release --arch arm64
